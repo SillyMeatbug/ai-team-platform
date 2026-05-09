@@ -1,0 +1,8 @@
+# LLM Aggregator — правила репозитория
+
+- Шаг 1: только каркас; реальные вызовы провайдеров — `# TODO: STEP 2+`.
+- Не логировать `query`, API-ключи, полные payloads; в логах — `request_id`, маршруты, статусы, метрики.
+- `httpx.AsyncClient` только из `app.state` (lifespan), не создавать клиент внутри хендлеров.
+- Конфиг маршрутов — `routes.yaml`, валидация при старте; горячая перезагрузка не реализована.
+- Заглушка 429: заголовок запроса `X-Skeleton-Force-429: 1` возвращает ответ с `Retry-After`.
+- Локально без оплаты API: по умолчанию `AGGREGATE_MOCK=true` — без HTTP к OpenRouter; для живых вызовов `AGGREGATE_MOCK=false` и `OPENROUTER_API_KEY` в `.env`.

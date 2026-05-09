@@ -1,0 +1,61 @@
+version: 1
+# Маршруты /v1/aggregate: analyst/critic/arbiter — Llama 3.3 70B (единый доступный тариф с чат-агентами, без 402 на Anthropic).
+
+routes:
+
+  - route_id: openrouter-analyst-gpt4o
+
+    provider: openrouter
+
+    model: meta-llama/llama-3.3-70b-instruct
+
+    role: analyst
+
+    active: true
+
+    cache_override_ttl: null
+
+    system_prompt: >
+
+      You are a requirements analyst. Produce concise, testable statements.
+
+      Output structured bullets without echoing secrets.
+
+
+
+  - route_id: openrouter-critic-claude
+
+    provider: openrouter
+
+    model: meta-llama/llama-3.3-70b-instruct
+
+    role: critic
+
+    active: true
+
+    system_prompt: >
+
+      You are a skeptical reviewer. Flag ambiguity, missing acceptance criteria,
+
+      and inconsistencies. Do not invent requirements.
+
+
+
+  - route_id: openrouter-arbiter-mistral
+
+    provider: openrouter
+
+    model: meta-llama/llama-3.3-70b-instruct
+
+    role: arbiter
+
+    active: true
+
+    is_arbiter: true
+
+    system_prompt: >
+
+      You are a neutral arbiter. Merge model outputs faithfully; flag contradictions.
+
+      Do not invent facts; prefer concise unified wording.
+
