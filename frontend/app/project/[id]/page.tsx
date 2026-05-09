@@ -1087,12 +1087,12 @@ export default function ProjectWorkspacePage({ params }: { params: Promise<{ id:
         <div className="mx-auto max-w-6xl w-full px-4 py-3 sm:px-6">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
-              <Link href="/">
-                <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-foreground">
+              <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-foreground" asChild>
+                <Link href="/">
                   <ArrowLeft className="w-5 h-5" />
                   <span className="sr-only">{t('project.backSr')}</span>
-                </Button>
-              </Link>
+                </Link>
+              </Button>
               <div>
                 {isBootstrapping ? (
                   <Skeleton className="h-6 w-48 mb-2" />

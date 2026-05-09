@@ -189,12 +189,12 @@ export default function CreateProjectPage() {
         <div className="mx-auto max-w-6xl px-4 py-4 sm:px-6">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-4 min-w-0">
-              <Link href="/">
-                <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-foreground shrink-0">
+              <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-foreground shrink-0" asChild>
+                <Link href="/">
                   <ArrowLeft className="w-5 h-5" />
                   <span className="sr-only">{t('createProject.backSr')}</span>
-                </Button>
-              </Link>
+                </Link>
+              </Button>
               <h1 className="font-semibold text-lg text-foreground truncate">{t('createProject.title')}</h1>
             </div>
             <LanguageToggle />

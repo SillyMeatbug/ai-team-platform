@@ -2,9 +2,18 @@
   "name": "my-project",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "scripts": {
-    "dev": "next dev --hostname 127.0.0.1",
+    "dev": "next dev --webpack --hostname 127.0.0.1",
+    "dev:turbo": "next dev --hostname 127.0.0.1",
     "dev:webpack": "next dev --webpack --hostname 127.0.0.1",
+    "cache:clean": "node ./scripts/clean-next.mjs && node ./scripts/clean-swc-cache.mjs",
+    "repair:next": "node ./scripts/repair-next.mjs",
+    "dev:clean": "node ./scripts/clean-next.mjs && next dev --webpack --hostname 127.0.0.1",
+    "dev:clean:turbo": "node ./scripts/clean-next.mjs && next dev --hostname 127.0.0.1",
+    "dev:clean:webpack": "node ./scripts/clean-next.mjs && next dev --webpack --hostname 127.0.0.1",
     "build": "next build",
     "start": "next start -p $PORT",
     "lint": "eslint ."
@@ -12,6 +21,7 @@
   "dependencies": {
     "@fontsource/jetbrains-mono": "^5.2.8",
     "@hookform/resolvers": "^3.9.1",
+    "@next/swc-win32-x64-msvc": "^16.2.6",
     "@radix-ui/react-accordion": "1.2.12",
     "@radix-ui/react-alert-dialog": "1.1.15",
     "@radix-ui/react-aspect-ratio": "1.1.8",
@@ -50,7 +60,7 @@
     "input-otp": "1.4.2",
     "lucide-react": "^0.564.0",
     "mermaid": "^11.14.0",
-    "next": "16.2.4",
+    "next": "^16.2.6",
     "next-themes": "^0.4.6",
     "react": "^19",
     "react-day-picker": "9.13.2",

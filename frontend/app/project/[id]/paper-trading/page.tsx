@@ -192,9 +192,11 @@ export default function PaperTradingPage({ params }: { params: Promise<{ id: str
       <header className="border-b border-border">
         <div className="mx-auto max-w-6xl px-4 py-3 sm:px-6 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <Link href={`/project/${id}`}>
-              <Button variant="ghost" size="icon"><ArrowLeft className="h-4 w-4" /></Button>
-            </Link>
+            <Button variant="ghost" size="icon" asChild>
+              <Link href={`/project/${id}`}>
+                <ArrowLeft className="h-4 w-4" />
+              </Link>
+            </Button>
             {loading ? <Skeleton className="h-6 w-48" /> : <h1 className="text-lg font-semibold">{projectName}</h1>}
           </div>
         </div>
@@ -345,11 +347,11 @@ export default function PaperTradingPage({ params }: { params: Promise<{ id: str
                       </td>
                       <td className="py-2 pr-3">
                         {tr.messageId ? (
-                          <Link href={`/project/${id}?focus_message_id=${encodeURIComponent(tr.messageId)}`}>
-                            <Button size="sm" variant="ghost" className="h-7 px-2 text-xs">
+                          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" asChild>
+                            <Link href={`/project/${id}?focus_message_id=${encodeURIComponent(tr.messageId)}`}>
                               <Link2 className="h-3.5 w-3.5 mr-1" /> Сообщение
-                            </Button>
-                          </Link>
+                            </Link>
+                          </Button>
                         ) : <span className="text-xs text-muted-foreground">—</span>}
                       </td>
                       <td className="py-2 pr-3">{tr.status === 'open' ? <Button size="sm" variant="outline" onClick={() => void closeManually(tr)}>Закрыть вручную</Button> : null}</td>

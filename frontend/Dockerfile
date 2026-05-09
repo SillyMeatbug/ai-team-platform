@@ -14,9 +14,13 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
 
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/.next/standalone ./.next/standalone
-COPY --from=builder /app/.next/static ./.next/static
+# Standalone server resolves `/_next/static` relative to this tree — not repo-root `.next/static`.
+COPY --from=builder /app/.next/standalone ./standalone
+COPY --from=builder /app/.next/static ./standalone/.next/static
+COPY --from=builder /app/public ./standalone/public
 
-CMD ["node", ".next/standalone/server.js"]
+WORKDIR /app/standalone
+
+CMD ["node", "server.js"]

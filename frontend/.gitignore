@@ -13,4 +13,6 @@ next.user-config.*
 # Common ignores
 node_modules
 .next/
+_swc_extract_tmp/
+next-swc-win32-x64-msvc-*.tgz
 .DS_Store

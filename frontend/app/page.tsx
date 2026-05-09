@@ -93,12 +93,12 @@ export default function DashboardPage() {
             </div>
             <div className="flex items-center gap-2 sm:gap-3 shrink-0">
               <LanguageToggle />
-              <Link href="/projects/new">
-                <Button className="gradient-accent text-white border-0 hover:opacity-90">
+              <Button asChild className="gradient-accent text-white border-0 hover:opacity-90">
+                <Link href="/projects/new">
                   <Plus className="w-4 h-4 sm:mr-2" />
                   <span className="hidden sm:inline">{t('dashboard.newProject')}</span>
-                </Button>
-              </Link>
+                </Link>
+              </Button>
             </div>
           </div>
         </div>
@@ -132,12 +132,12 @@ export default function DashboardPage() {
             <p className="text-sm text-muted-foreground text-center max-w-sm mb-6">
               {t('dashboard.emptySubtitle')}
             </p>
-            <Link href="/projects/new">
-              <Button className="gradient-accent text-white border-0 hover:opacity-90">
+            <Button asChild className="gradient-accent text-white border-0 hover:opacity-90">
+              <Link href="/projects/new">
                 <Plus className="w-4 h-4 mr-2" />
                 {t('dashboard.createFirst')}
-              </Button>
-            </Link>
+              </Link>
+            </Button>
           </div>
         )}
       </main>
