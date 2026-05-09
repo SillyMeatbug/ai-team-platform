@@ -839,6 +839,48 @@ async def fetch_live_context(
     return base
 
 
+def _timeframe_to_timedelta(tf: str | None) -> timedelta:
+    """Длительность одной свечи (грубо, для порога свежести OHLCV)."""
+    if not tf:
+        return timedelta(hours=4)
+    raw = str(tf).strip()
+    if _TF_MONTH_RE.fullmatch(raw):
+        try:
+            n = max(1, int(raw[:-1]))
+        except ValueError:
+            n = 1
+        return timedelta(days=30 * n)
+    t = raw.lower()
+    if len(t) < 2:
+        return timedelta(hours=4)
+    unit = t[-1]
+    try:
+        n = int(t[:-1])
+    except ValueError:
+        return timedelta(hours=4)
+    if unit == "m":
+        return timedelta(minutes=max(1, n))
+    if unit == "h":
+        return timedelta(hours=max(1, n))
+    if unit == "d":
+        return timedelta(days=max(1, n))
+    if unit == "w":
+        return timedelta(weeks=max(1, n))
+    return timedelta(hours=4)
+
+
+def _ohlcv_last_open_max_age(tf: str | None) -> timedelta:
+    """Допустимый возраст timestamp последней свечи (у Binance это время ОТКРЫТИЯ бара).
+
+    Раньше использовался фиксированный 1h — из‑за этого 4H/1D всегда были STALE после первого часа бара,
+    и Technical Analyst получал жёсткий PASS при живых данных.
+    """
+    bar = _timeframe_to_timedelta(tf)
+    slack = timedelta(minutes=45)
+    # Нижняя граница 90s — для 1m не раздуваем окно до часа
+    return max(bar + slack, timedelta(seconds=90))
+
+
 def compute_data_freshness_status(ctx: dict[str, Any] | None) -> str:
     """Агрегированный статус для промптов: LIVE | CACHED | STALE | UNAVAILABLE."""
     if not ctx:
@@ -859,7 +901,10 @@ def compute_data_freshness_status(ctx: dict[str, Any] | None) -> str:
         )
     except ValueError:
         return "UNAVAILABLE"
-    if datetime.now(UTC) - parsed > timedelta(hours=1):
+    tf_ctx = ctx.get("timeframe")
+    tf_key = tf_ctx if isinstance(tf_ctx, str) else None
+    max_age = _ohlcv_last_open_max_age(normalize_ohlcv_timeframe(tf_key) if tf_key else None)
+    if datetime.now(UTC) - parsed > max_age:
         return "STALE"
     if ctx.get("stale_data") is True:
         return "STALE"
