@@ -91,6 +91,14 @@ class Settings(BaseSettings):
         default="sqlite+aiosqlite:///./ai_platform.db",
         validation_alias=AliasChoices("DATABASE_URL", "database_url"),
     )
+    cors_allowed_origins: str = Field(
+        default="",
+        description=(
+            "Дополнительные origins для CORS через запятую "
+            "(например продакшен frontend на Railway)."
+        ),
+        validation_alias=AliasChoices("CORS_ALLOWED_ORIGINS", "cors_allowed_origins"),
+    )
     upload_dir: Path = Field(
         default=Path("./uploads"),
         validation_alias=AliasChoices("UPLOAD_DIR", "upload_dir"),

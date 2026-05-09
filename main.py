@@ -22,6 +22,22 @@ settings = load_settings()
 apply_openrouter_env(settings)
 configure_logging(settings.log_level)
 
+
+def _cors_allow_origins() -> list[str]:
+    base = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ]
+    extra = [
+        o.strip()
+        for o in settings.cors_allowed_origins.split(",")
+        if o.strip()
+    ]
+    return base + extra
+
+
 app = FastAPI(
     title="LLM Aggregator",
     version="0.1.0",
@@ -29,16 +45,19 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-    ],
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    """Корень: чтобы прод-домен не отдавал 404 без контекста."""
+    return {"status": "ok", "docs": "/docs"}
+
+
 app.include_router(router)
 app.include_router(projects_router, prefix="/v1")
 app.include_router(files_router, prefix="/v1")
