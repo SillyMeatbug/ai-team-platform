@@ -30,15 +30,28 @@ export const viewport: Viewport = {
   colorScheme: 'dark',
 }
 
+/** Публичный URL бэкенда для браузера: на Railway берётся из env во время запроса (не только из bake сборки). */
+function publicApiUrlForClient(): string {
+  return (
+    process.env.BACKEND_PUBLIC_URL?.trim() ||
+    process.env.NEXT_PUBLIC_API_URL?.trim() ||
+    process.env.NEXT_PUBLIC_API_BASE_URL?.trim() ||
+    ''
+  )
+}
+
 export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode
 }>) {
+  const apiPublicUrl = publicApiUrlForClient()
+
   return (
     <html
       lang="en"
       suppressHydrationWarning
+      data-api-public-url={apiPublicUrl}
       className={`${inter.variable} ${jetbrainsMono.variable} dark bg-background`}
     >
       <body className="font-sans antialiased min-h-screen">
@@ -46,7 +59,9 @@ export default function RootLayout({
           {children}
           <Toaster />
         </LocaleProvider>
-        {process.env.NODE_ENV === 'production' && <Analytics />}
+        {process.env.NODE_ENV === 'production' && process.env.VERCEL === '1' ? (
+          <Analytics />
+        ) : null}
       </body>
     </html>
   )

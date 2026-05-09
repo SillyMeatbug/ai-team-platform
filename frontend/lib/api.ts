@@ -16,10 +16,21 @@ import type {
 } from '@/lib/types'
 
 /** По умолчанию 127.0.0.1: на Windows `localhost` часто уходит в IPv6 (::1), а uvicorn слушает IPv4 — запрос «висит». */
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL ??
-  process.env.NEXT_PUBLIC_API_BASE_URL ??
-  'http://127.0.0.1:8000'
+export function getApiBaseUrl(): string {
+  if (typeof window !== 'undefined') {
+    const fromDom = document.documentElement
+      .getAttribute('data-api-public-url')
+      ?.trim()
+    if (fromDom) return fromDom.replace(/\/$/, '')
+  }
+  const raw =
+    process.env.BACKEND_PUBLIC_URL?.trim() ||
+    process.env.NEXT_PUBLIC_API_URL?.trim() ||
+    process.env.NEXT_PUBLIC_API_BASE_URL?.trim() ||
+    ''
+  const base = raw || 'http://127.0.0.1:8000'
+  return base.replace(/\/$/, '')
+}
 
 type RequestOptions = {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
@@ -47,7 +58,7 @@ async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<
 
   let res: Response
   try {
-    res = await fetch(`${API_BASE_URL}${path}`, {
+    res = await fetch(`${getApiBaseUrl()}${path}`, {
       method: options.method ?? 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -62,7 +73,7 @@ async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<
     if (name === 'AbortError') {
       if (didTimeout) {
         throw new Error(
-          `Нет ответа от API (${API_BASE_URL}) за ${API_FETCH_TIMEOUT_MS / 1000} с. Запустите бэкенд (127.0.0.1:8000): uvicorn main:app --host 127.0.0.1 --port 8000`
+          `Нет ответа от API (${getApiBaseUrl()}) за ${API_FETCH_TIMEOUT_MS / 1000} с. Запустите бэкенд (127.0.0.1:8000): uvicorn main:app --host 127.0.0.1 --port 8000`
         )
       }
       throw e
@@ -459,7 +470,7 @@ export async function uploadProjectFile(projectId: string, file: File, category:
   formData.append('file', file)
   formData.append('category', category)
 
-  const res = await fetch(`${API_BASE_URL}/v1/projects/${projectId}/files`, {
+  const res = await fetch(`${getApiBaseUrl()}/v1/projects/${projectId}/files`, {
     method: 'POST',
     body: formData,
   })
@@ -482,7 +493,7 @@ export async function deleteProjectFile(projectId: string, fileId: string): Prom
 }
 
 export function getDownloadUrl(fileId: string): string {
-  return `${API_BASE_URL}/v1/files/${fileId}/download`
+  return `${getApiBaseUrl()}/v1/files/${fileId}/download`
 }
 
 export async function getProjectChat(projectId: string): Promise<ChatMessage[]> {
@@ -592,7 +603,7 @@ export async function streamChatMessage(
   if (payload.locale) body.locale = payload.locale
   if (payload.file_ids?.length) body.file_ids = payload.file_ids
 
-  const res = await fetch(`${API_BASE_URL}/v1/projects/${projectId}/chat/stream`, {
+  const res = await fetch(`${getApiBaseUrl()}/v1/projects/${projectId}/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

@@ -1,3 +1,5 @@
+/** Контроль NEXT_PUBLIC_* при сборке Docker — см. frontend/Dockerfile (RUN перед npm run build). */
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   /** Убирает круглую кнопку «N» (индикатор dev-инструментов) в углу экрана */
