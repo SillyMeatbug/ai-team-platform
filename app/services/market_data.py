@@ -996,8 +996,9 @@ async def fetch_live_context(
         df = cached_ohlcv.value.copy()
         stale = True
 
-    if cached_ohlcv is not None and _is_expired(cached_ohlcv):
-        stale = True
+    # Не помечаем снимок stale из‑за протухшего *предыдущего* кэша: fetch_ohlcv уже мог
+    # успешно подтянуть сеть и обновить TTL — старый cached_ohlcv здесь только для справки.
+
     if stale:
         freshness = "cached"
 
@@ -1013,8 +1014,8 @@ async def fetch_live_context(
 
     if market.get("stale_data") is True:
         freshness = "cached" if freshness == "live" else freshness
-    if freshness == "cached":
-        stale = True
+    # Не выставляем stale_data для всего контекста только потому что funding/OI в кэше stale —
+    # теханализ опирается на OHLCV; иначе Railway при живых свечах даёт жёсткий PASS.
 
     close = pd.to_numeric(df["close"], errors="coerce")
     price = float(close.iloc[-1]) if not close.empty else None
@@ -1130,8 +1131,7 @@ def compute_data_freshness_status(ctx: dict[str, Any] | None) -> str:
     max_age = _ohlcv_last_open_max_age(normalize_ohlcv_timeframe(tf_key) if tf_key else None)
     if datetime.now(UTC) - parsed > max_age:
         return "STALE"
-    if ctx.get("stale_data") is True:
-        return "STALE"
+    # stale_data — про деривативные метрики/аварийный кэш OHLCV; при свежих свечах не даём STALE.
     if ctx.get("data_freshness") == "live":
         return "LIVE"
     return "CACHED"
