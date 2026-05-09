@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -27,6 +28,13 @@ try:
     import ccxt.async_support as ccxt_async
 except Exception:  # pragma: no cover
     ccxt_async = None
+
+if ccxt_async is None:
+    logger.warning("ccxt_async unavailable: OHLCV via CCXT disabled until package installs")
+else:
+    logger.info("ccxt async_support loaded for Binance OHLCV")
+
+_TF_MONTH_RE = re.compile(r"^(\d+)M$")
 
 try:
     import pandas_ta as ta  # type: ignore
@@ -46,7 +54,10 @@ _CACHE_LOCK = asyncio.Lock()
 
 
 def _ttl_for_timeframe(timeframe: str) -> int:
-    tf = (timeframe or "").lower()
+    raw = (timeframe or "").strip()
+    if _TF_MONTH_RE.fullmatch(raw):
+        return 86_400
+    tf = raw.lower()
     if tf in {"1m", "3m", "5m", "15m"}:
         return 300
     if tf in {"30m", "1h", "2h"}:
@@ -76,6 +87,30 @@ async def _set_cache(key: str, value: Any, ttl_s: int) -> None:
 
 def _is_expired(entry: _CacheEntry) -> bool:
     return asyncio.get_event_loop().time() > entry.expires_at
+
+
+def normalize_ccxt_symbol(symbol: str | None) -> str:
+    """Формат пары для CCXT Spot Binance: BTC/USDT (не BTCUSDT)."""
+    s = (symbol or "").strip().upper().replace("-", "/")
+    if not s:
+        return "BTC/USDT"
+    if "/" in s:
+        parts = s.split("/", 1)
+        return f"{parts[0].strip()}/{parts[1].strip()}"
+    for quote in ("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "BTC", "ETH", "BNB"):
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[: -len(quote)]}/{quote}"
+    return f"{s}/USDT"
+
+
+def normalize_ohlcv_timeframe(timeframe: str | None) -> str:
+    """Binance/CCXT: минуты/часы в нижнем регистре (4H → 4h); месяц — только «NM» с большой M (1m ≠ 1M)."""
+    if timeframe is None or not str(timeframe).strip():
+        return "4h"
+    t = str(timeframe).strip()
+    if _TF_MONTH_RE.fullmatch(t):
+        return t
+    return t.lower()
 
 
 def _to_binance_symbol(symbol: str) -> str:
@@ -317,6 +352,71 @@ async def _fetch_ohlcv_remote(symbol: str, timeframe: str, limit: int) -> pd.Dat
     return df
 
 
+async def fetch_ohlcv_raw_debug(
+    symbol: str,
+    timeframe: str,
+    limit: int = 120,
+) -> dict[str, Any]:
+    """Сырые списки свечей CCXT [[ts_ms, o,h,l,c,v], ...] без кэша и без pandas."""
+    sym = normalize_ccxt_symbol(symbol)
+    tf = normalize_ohlcv_timeframe(timeframe)
+    lim = max(1, min(int(limit), 1000))
+    if ccxt_async is None:
+        return {
+            "ok": False,
+            "error": "ccxt_async_unavailable",
+            "symbol": sym,
+            "timeframe": tf,
+            "candles": [],
+        }
+    exchange = ccxt_async.binance({"enableRateLimit": True})
+    try:
+        logger.info("Fetching OHLCV (debug raw): %s %s (limit=%s)", sym, tf, lim)
+        rows = await exchange.fetch_ohlcv(sym, timeframe=tf, limit=lim)
+        if not rows:
+            logger.warning("OHLCV raw result: empty list from exchange")
+            return {
+                "ok": False,
+                "error": "empty_ohlcv",
+                "symbol": sym,
+                "timeframe": tf,
+                "candles": [],
+            }
+        last_raw = rows[-1][0]
+        last_iso = (
+            datetime.fromtimestamp(last_raw / 1000.0, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+            if last_raw is not None
+            else None
+        )
+        logger.info("OHLCV raw result: %s candles, last=%s", len(rows), last_iso)
+        return {
+            "ok": True,
+            "exchange_id": getattr(exchange, "id", "binance"),
+            "symbol": sym,
+            "timeframe": tf,
+            "limit": lim,
+            "count": len(rows),
+            "last_open_time_ms": last_raw,
+            "last_open_time_utc": last_iso,
+            "candles": rows,
+        }
+    except Exception as e:
+        logger.warning(
+            "fetch_ohlcv_raw_debug_failed",
+            extra={"symbol": sym, "timeframe": tf, "error": type(e).__name__},
+        )
+        return {
+            "ok": False,
+            "error": type(e).__name__,
+            "detail": str(e)[:800],
+            "symbol": sym,
+            "timeframe": tf,
+            "candles": [],
+        }
+    finally:
+        await exchange.close()
+
+
 async def _new_binance_exchange() -> Any:
     if ccxt_async is None:
         raise RuntimeError("ccxt async backend unavailable")
@@ -324,14 +424,31 @@ async def _new_binance_exchange() -> Any:
 
 
 async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
-    key = _cache_key("ohlcv", symbol=symbol, timeframe=timeframe, limit=limit)
-    ttl_s = _ttl_for_timeframe(timeframe)
+    sym = normalize_ccxt_symbol(symbol)
+    tf = normalize_ohlcv_timeframe(timeframe)
+    lim = max(1, min(int(limit), 1000))
+    logger.info("Fetching OHLCV: %s %s (limit=%s)", sym, tf, lim)
+    key = _cache_key("ohlcv", symbol=sym, timeframe=tf, limit=lim)
+    ttl_s = _ttl_for_timeframe(tf)
     cached = await _get_cache(key)
     if cached and not _is_expired(cached):
-        return cached.value.copy()
+        df_hit = cached.value.copy()
+        try:
+            last_ts = df_hit["timestamp"].iloc[-1]
+            last_str = pd.Timestamp(last_ts).strftime("%Y-%m-%d %H:%M UTC") if len(df_hit) else None
+        except Exception:
+            last_str = None
+        logger.info("OHLCV cache hit: %s candles, last=%s", len(df_hit), last_str)
+        return df_hit
     try:
-        df = await _fetch_ohlcv_remote(symbol, timeframe, limit)
+        df = await _fetch_ohlcv_remote(sym, tf, lim)
         await _set_cache(key, df, ttl_s)
+        try:
+            last_ts = df["timestamp"].iloc[-1]
+            last_str = pd.Timestamp(last_ts).strftime("%Y-%m-%d %H:%M UTC") if len(df) else None
+        except Exception:
+            last_str = None
+        logger.info("OHLCV result: %s candles, last=%s", len(df), last_str)
         return df.copy()
     except Exception as e:
         if cached is not None:
@@ -341,7 +458,10 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 200) -> pd.DataF
 
 
 async def get_ohlcv_cache_info(symbol: str, timeframe: str, limit: int = 200) -> dict[str, Any]:
-    key = _cache_key("ohlcv", symbol=symbol, timeframe=timeframe, limit=limit)
+    sym = normalize_ccxt_symbol(symbol)
+    tf = normalize_ohlcv_timeframe(timeframe)
+    lim = max(1, min(int(limit), 1000))
+    key = _cache_key("ohlcv", symbol=sym, timeframe=tf, limit=lim)
     entry = await _get_cache(key)
     if entry is None:
         return {"hit": False, "ttl_remaining_sec": 0}
@@ -599,9 +719,10 @@ async def fetch_news_sentiment(symbol: str) -> list[dict[str, Any]]:
 async def fetch_live_context(
     asset: str, timeframe: str = "4h", limit: int = 200, *, force_refresh: bool = False
 ) -> dict[str, Any]:
-    symbol = (asset or "BTC/USDT").upper()
-    tf = (timeframe or "4h").lower()
-    ohlcv_key = _cache_key("ohlcv", symbol=symbol, timeframe=tf, limit=limit)
+    symbol = normalize_ccxt_symbol(asset)
+    tf = normalize_ohlcv_timeframe(timeframe)
+    lim = max(1, min(int(limit), 1000))
+    ohlcv_key = _cache_key("ohlcv", symbol=symbol, timeframe=tf, limit=lim)
     cached_ohlcv = await _get_cache(ohlcv_key)
 
     freshness = "live"
@@ -610,10 +731,10 @@ async def fetch_live_context(
     try:
         if force_refresh and ccxt_async is not None:
             # Принудительно обновляем источник, затем используем как новое live-состояние.
-            df = await _fetch_ohlcv_remote(symbol, tf, limit)
+            df = await _fetch_ohlcv_remote(symbol, tf, lim)
             await _set_cache(ohlcv_key, df, _ttl_for_timeframe(tf))
         else:
-            df = await fetch_ohlcv(symbol, tf, limit)
+            df = await fetch_ohlcv(symbol, tf, lim)
     except Exception:
         if cached_ohlcv is None:
             market_e, news_e, funding_e, exchange_e, fear_e = await _gather_parallel_market_extras(symbol)

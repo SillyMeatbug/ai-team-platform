@@ -8,11 +8,22 @@ from fastapi import APIRouter, Query
 
 from app.services.market_data import (
     fetch_live_context,
+    fetch_ohlcv_raw_debug,
     format_live_context_markdown,
     has_actionable_onchain_proxy,
 )
 
 router = APIRouter(tags=["debug"])
+
+
+@router.get("/debug/ohlcv")
+async def debug_ohlcv(
+    asset: str = Query(default="BTC/USDT"),
+    timeframe: str = Query(default="4H"),
+    limit: int = Query(default=120, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Сырые свечи CCXT без pandas и без TTL-кэша приложения."""
+    return await fetch_ohlcv_raw_debug(asset, timeframe, limit)
 
 
 @router.get("/debug/onchain-proxy")
