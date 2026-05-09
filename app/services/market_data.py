@@ -34,6 +34,9 @@ if ccxt_async is None:
 else:
     logger.info("ccxt async_support loaded for Binance OHLCV")
 
+# Binance api.binance.com часто отдаёт 451 из облака (EU/US — restricted location). Fallback OHLCV без ключей.
+_OHLCV_EXCHANGE_FALLBACK_CHAIN: tuple[str, ...] = ("binance", "bybit", "okx")
+
 _TF_MONTH_RE = re.compile(r"^(\d+)M$")
 
 try:
@@ -331,16 +334,21 @@ async def _gather_parallel_market_extras(symbol: str) -> tuple[dict[str, Any], l
     return market, news, funding_rest, exchange_vol, fear_greed
 
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-    retry=retry_if_exception_type(Exception),
-)
-async def _fetch_ohlcv_remote(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+def _ohlcv_exchange_config(exchange_id: str) -> dict[str, Any]:
+    cfg: dict[str, Any] = {"enableRateLimit": True}
+    if exchange_id in ("bybit", "okx"):
+        cfg["options"] = {"defaultType": "spot"}
+    return cfg
+
+
+async def _fetch_ohlcv_one_exchange(exchange_id: str, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """Одна попытка OHLCV; в df.attrs кладётся ohlcv_exchange."""
     if ccxt_async is None:
         raise RuntimeError("ccxt async backend unavailable")
-    exchange = ccxt_async.binance({"enableRateLimit": True})
+    klass = getattr(ccxt_async, exchange_id, None)
+    if klass is None:
+        raise RuntimeError(f"ccxt has no exchange class: {exchange_id}")
+    exchange = klass(_ohlcv_exchange_config(exchange_id))
     try:
         rows = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     finally:
@@ -349,7 +357,42 @@ async def _fetch_ohlcv_remote(symbol: str, timeframe: str, limit: int) -> pd.Dat
         raise RuntimeError("empty ohlcv payload")
     df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.attrs["ohlcv_exchange"] = exchange_id
     return df
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+    retry=retry_if_exception_type(Exception),
+)
+async def _fetch_ohlcv_remote(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """Сначала Binance, затем Bybit/OKX spot (обход HTTP 451 restricted location)."""
+    if ccxt_async is None:
+        raise RuntimeError("ccxt async backend unavailable")
+    errs: list[str] = []
+    for ex_id in _OHLCV_EXCHANGE_FALLBACK_CHAIN:
+        try:
+            df = await _fetch_ohlcv_one_exchange(ex_id, symbol, timeframe, limit)
+            logger.info(
+                "ohlcv_exchange_selected",
+                extra={"exchange": ex_id, "symbol": symbol, "timeframe": timeframe},
+            )
+            return df
+        except Exception as e:
+            errs.append(f"{ex_id}:{type(e).__name__}")
+            logger.warning(
+                "ohlcv_exchange_failed",
+                extra={
+                    "exchange": ex_id,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "error": type(e).__name__,
+                },
+            )
+            continue
+    raise RuntimeError("OHLCV failed on all exchanges: " + ", ".join(errs))
 
 
 async def fetch_ohlcv_raw_debug(
@@ -369,52 +412,61 @@ async def fetch_ohlcv_raw_debug(
             "timeframe": tf,
             "candles": [],
         }
-    exchange = ccxt_async.binance({"enableRateLimit": True})
-    try:
-        logger.info("Fetching OHLCV (debug raw): %s %s (limit=%s)", sym, tf, lim)
-        rows = await exchange.fetch_ohlcv(sym, timeframe=tf, limit=lim)
-        if not rows:
-            logger.warning("OHLCV raw result: empty list from exchange")
+    logger.info("Fetching OHLCV (debug raw): %s %s (limit=%s)", sym, tf, lim)
+    attempts: list[dict[str, str]] = []
+    last_detail = ""
+    for ex_id in _OHLCV_EXCHANGE_FALLBACK_CHAIN:
+        klass = getattr(ccxt_async, ex_id, None)
+        if klass is None:
+            attempts.append({"exchange": ex_id, "error": "class_missing"})
+            continue
+        ex = klass(_ohlcv_exchange_config(ex_id))
+        try:
+            rows = await ex.fetch_ohlcv(sym, timeframe=tf, limit=lim)
+            if not rows:
+                attempts.append({"exchange": ex_id, "error": "empty_ohlcv"})
+                continue
+            last_raw = rows[-1][0]
+            last_iso = datetime.fromtimestamp(last_raw / 1000.0, tz=UTC).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+            logger.info(
+                "OHLCV raw result: exchange=%s candles=%s last=%s",
+                ex_id,
+                len(rows),
+                last_iso,
+            )
             return {
-                "ok": False,
-                "error": "empty_ohlcv",
+                "ok": True,
+                "exchange_id": ex_id,
                 "symbol": sym,
                 "timeframe": tf,
-                "candles": [],
+                "limit": lim,
+                "count": len(rows),
+                "last_open_time_ms": last_raw,
+                "last_open_time_utc": last_iso,
+                "candles": rows,
+                "fallback_attempts": attempts,
             }
-        last_raw = rows[-1][0]
-        last_iso = (
-            datetime.fromtimestamp(last_raw / 1000.0, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
-            if last_raw is not None
-            else None
-        )
-        logger.info("OHLCV raw result: %s candles, last=%s", len(rows), last_iso)
-        return {
-            "ok": True,
-            "exchange_id": getattr(exchange, "id", "binance"),
-            "symbol": sym,
-            "timeframe": tf,
-            "limit": lim,
-            "count": len(rows),
-            "last_open_time_ms": last_raw,
-            "last_open_time_utc": last_iso,
-            "candles": rows,
-        }
-    except Exception as e:
-        logger.warning(
-            "fetch_ohlcv_raw_debug_failed",
-            extra={"symbol": sym, "timeframe": tf, "error": type(e).__name__},
-        )
-        return {
-            "ok": False,
-            "error": type(e).__name__,
-            "detail": str(e)[:800],
-            "symbol": sym,
-            "timeframe": tf,
-            "candles": [],
-        }
-    finally:
-        await exchange.close()
+        except Exception as e:
+            last_detail = str(e)[:800]
+            attempts.append({"exchange": ex_id, "error": f"{type(e).__name__}:{last_detail[:200]}"})
+            logger.warning(
+                "fetch_ohlcv_raw_debug_try_failed",
+                extra={"exchange": ex_id, "error": type(e).__name__},
+            )
+        finally:
+            await ex.close()
+    return {
+        "ok": False,
+        "error": "all_exchanges_failed",
+        "detail": last_detail,
+        "symbol": sym,
+        "timeframe": tf,
+        "candles": [],
+        "fallback_attempts": attempts,
+        "note": "Binance часто отвечает 451 из облака EU; используйте fallback Bybit/OKX в ответе или см. логи.",
+    }
 
 
 async def _new_binance_exchange() -> Any:
@@ -832,6 +884,7 @@ async def fetch_live_context(
         "news_sentiment": news,
         "data_freshness": freshness,
         "source": market.get("source") or source,
+        "ohlcv_exchange": str(df.attrs.get("ohlcv_exchange", "unknown")),
         "stale_data": stale,
         **proxy_pack,
     }
