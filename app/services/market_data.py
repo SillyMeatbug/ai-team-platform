@@ -83,6 +83,219 @@ def _to_binance_symbol(symbol: str) -> str:
     return s.replace("/", "")
 
 
+def _normalize_fear_greed_from_index_payload(payload: Any) -> dict[str, Any]:
+    """Разбор ответа Alternative.me FNG (сырой JSON)."""
+    if not isinstance(payload, dict):
+        return {"value": None, "classification": "No Data", "source": "unavailable"}
+    row = (payload.get("data") or [{}])[0]
+    if not isinstance(row, dict):
+        return {"value": None, "classification": "No Data", "source": "unavailable"}
+    raw_v = row.get("value")
+    val: int | None = None
+    if raw_v is not None and raw_v != "":
+        try:
+            val = int(float(str(raw_v).strip()))
+        except (TypeError, ValueError):
+            val = None
+    return {
+        "value": val,
+        "classification": str(row.get("value_classification") or "unknown"),
+        "source": "alternative_me",
+    }
+
+
+async def fetch_funding_rate(symbol: str) -> dict[str, Any]:
+    """Последняя ставка фандинга Binance USDT-M (`premiumIndex`). Бесплатно, без ключей."""
+    sym = _to_binance_symbol(symbol)
+    if not sym:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                params={"symbol": sym},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("fetch_funding_rate_failed", extra={"symbol": sym, "error": type(e).__name__})
+        return {}
+
+
+async def fetch_fear_greed_index() -> dict[str, Any]:
+    """Сырой JSON Alternative.me Fear & Greed (`limit=1`)."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get("https://api.alternative.me/fng/", params={"limit": 1})
+            resp.raise_for_status()
+            data = resp.json()
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("fetch_fear_greed_index_failed", extra={"error": type(e).__name__})
+        return {}
+
+
+async def fetch_exchange_volumes(symbol: str) -> dict[str, Any]:
+    """Спот Binance 24h ticker — объёмы и доля taker-buy как прокси «давления»."""
+    sym = _to_binance_symbol(symbol)
+    if not sym:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.binance.com/api/v3/ticker/24hr",
+                params={"symbol": sym},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        if not isinstance(data, dict):
+            return {}
+        qv = float(data.get("quoteVolume") or 0)
+        tbqv = float(data.get("takerBuyQuoteAssetVolume") or 0)
+        ratio = (tbqv / qv) if qv > 0 else None
+        return {
+            "quote_volume_24h": qv,
+            "taker_buy_quote_volume_24h": tbqv,
+            "taker_buy_quote_share": ratio,
+            "symbol": sym,
+            "source": "binance_spot_24hr",
+        }
+    except Exception as e:
+        logger.warning("fetch_exchange_volumes_failed", extra={"symbol": sym, "error": type(e).__name__})
+        return {}
+
+
+def _onchain_proxy_strings_usable(ctx: dict[str, Any]) -> bool:
+    """True, если в строках прокси есть хоть одно содержательное значение (не заглушка)."""
+    for key in ("funding_rate", "fear_greed_index", "approx_exchange_flow"):
+        v = ctx.get(key)
+        if not isinstance(v, str):
+            continue
+        s = v.strip()
+        if not s or s == "Нет данных":
+            continue
+        return True
+    return False
+
+
+def _pack_onchain_proxy_fields(
+    *,
+    market: dict[str, Any],
+    fear_greed: dict[str, Any],
+    funding_rest: dict[str, Any],
+    exchange_vol: dict[str, Any],
+) -> dict[str, Any]:
+    """Строки для промпта + флаг достаточности прокси для On-chain Analyst."""
+    fr_pct: float | None = None
+    if funding_rest.get("lastFundingRate") is not None:
+        try:
+            fr_pct = float(funding_rest["lastFundingRate"]) * 100.0
+        except (TypeError, ValueError):
+            fr_pct = None
+    if fr_pct is None and market.get("funding_rate") is not None:
+        try:
+            fr_pct = float(market["funding_rate"])
+        except (TypeError, ValueError):
+            fr_pct = None
+    funding_rate_str = (
+        f"{fr_pct:.6f}% (Binance USDT-M premiumIndex)" if fr_pct is not None else "Нет данных"
+    )
+
+    fg_val = fear_greed.get("value")
+    fg_cls = fear_greed.get("classification", "")
+    fear_greed_index_str = (
+        f"{fg_val} ({fg_cls}) [alternative.me]" if fg_val is not None else "Нет данных"
+    )
+
+    qv = exchange_vol.get("quote_volume_24h")
+    ratio = exchange_vol.get("taker_buy_quote_share")
+    approx_flow_str = "Нет данных"
+    if isinstance(qv, (int, float)) and qv > 0:
+        if ratio is not None:
+            approx_flow_str = (
+                f"Quote vol 24h: {float(qv):,.0f} USDT | "
+                f"taker-buy quote share: {float(ratio) * 100:.2f}% (Binance spot 24h, прокси давления)"
+            )
+        else:
+            approx_flow_str = f"Quote vol 24h: {float(qv):,.0f} USDT (Binance spot 24h)"
+
+    onchain_proxy_ok = bool(
+        fr_pct is not None
+        or fg_val is not None
+        or (isinstance(qv, (int, float)) and float(qv) > 0)
+    )
+    if not onchain_proxy_ok:
+        onchain_proxy_ok = _onchain_proxy_strings_usable(
+            {
+                "funding_rate": funding_rate_str,
+                "fear_greed_index": fear_greed_index_str,
+                "approx_exchange_flow": approx_flow_str,
+            }
+        )
+
+    return {
+        "funding_rate": funding_rate_str,
+        "fear_greed_index": fear_greed_index_str,
+        "approx_exchange_flow": approx_flow_str,
+        "onchain_proxy_ok": onchain_proxy_ok,
+        "onchain_proxy_detail": {
+            "premium_index": funding_rest,
+            "spot_24h": exchange_vol,
+        },
+    }
+
+
+def has_actionable_onchain_proxy(ctx: dict[str, Any] | None) -> bool:
+    """Есть ли бесплатные прокси-метрики для ончейн-роли (обход жёсткого PASS в оркестраторе)."""
+    if not ctx:
+        return False
+    if ctx.get("onchain_proxy_ok") is True:
+        return True
+    return _onchain_proxy_strings_usable(ctx)
+
+
+def _log_onchain_proxy_pack(proxy_pack: dict[str, Any]) -> None:
+    logger.info(
+        "On-chain proxy: funding=%s fg=%s flow=%s",
+        proxy_pack.get("funding_rate"),
+        proxy_pack.get("fear_greed_index"),
+        proxy_pack.get("approx_exchange_flow"),
+    )
+    logger.info("onchain_proxy_ok=%s", proxy_pack.get("onchain_proxy_ok"))
+
+
+async def _gather_parallel_market_extras(symbol: str) -> tuple[dict[str, Any], list[Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Параллельно: деривативные метрики (ccxt), новости, REST funding, спот 24h, F&G."""
+    market_r, news_r, funding_r, exchange_r, fg_raw_r = await asyncio.gather(
+        fetch_market_metrics(symbol),
+        fetch_news_sentiment(symbol),
+        fetch_funding_rate(symbol),
+        fetch_exchange_volumes(symbol),
+        fetch_fear_greed_index(),
+        return_exceptions=True,
+    )
+    market: dict[str, Any] = (
+        market_r if isinstance(market_r, dict) else {"stale_data": True, "source": "unavailable"}
+    )
+    news: list[Any] = news_r if isinstance(news_r, list) else []
+    funding_rest = funding_r if isinstance(funding_r, dict) else {}
+    exchange_vol = exchange_r if isinstance(exchange_r, dict) else {}
+    fg_raw = fg_raw_r if isinstance(fg_raw_r, dict) else {}
+    if isinstance(market_r, Exception):
+        logger.warning("gather_market_metrics_failed", extra={"error": type(market_r).__name__})
+    if isinstance(news_r, Exception):
+        logger.warning("gather_news_failed", extra={"error": type(news_r).__name__})
+    if isinstance(funding_r, Exception):
+        logger.warning("gather_funding_failed", extra={"error": type(funding_r).__name__})
+    if isinstance(exchange_r, Exception):
+        logger.warning("gather_exchange_vol_failed", extra={"error": type(exchange_r).__name__})
+    if isinstance(fg_raw_r, Exception):
+        logger.warning("gather_fear_greed_failed", extra={"error": type(fg_raw_r).__name__})
+    fear_greed = _normalize_fear_greed_from_index_payload(fg_raw)
+    return market, news, funding_rest, exchange_vol, fear_greed
+
+
 @retry(
     reraise=True,
     stop=stop_after_attempt(3),
@@ -403,17 +616,39 @@ async def fetch_live_context(
             df = await fetch_ohlcv(symbol, tf, limit)
     except Exception:
         if cached_ohlcv is None:
+            market_e, news_e, funding_e, exchange_e, fear_e = await _gather_parallel_market_extras(symbol)
+            proxy_e = _pack_onchain_proxy_fields(
+                market=market_e,
+                fear_greed=fear_e,
+                funding_rest=funding_e,
+                exchange_vol=exchange_e,
+            )
+            _log_onchain_proxy_pack(proxy_e)
             now_u = datetime.now(UTC)
-            return {
+            out_fail: dict[str, Any] = {
                 "asset": symbol,
-                "timeframe": tf,
+                "timeframe": tf.upper(),
                 "updated_at": now_u.strftime("%Y-%m-%d %H:%M"),
                 "current_system_time_utc": now_u.strftime("%Y-%m-%d %H:%M"),
                 "last_ohlcv_candle_utc": None,
                 "data_freshness": "unavailable",
-                "source": "unavailable",
+                "source": market_e.get("source") or "unavailable",
                 "stale_data": True,
+                "price": None,
+                "open": None,
+                "high": None,
+                "low": None,
+                "volume": None,
+                "candles_count": 0,
+                "change_24h_pct": None,
+                "indicators": {},
+                "market_metrics": market_e,
+                "fear_greed": fear_e,
+                "news_sentiment": news_e,
+                **proxy_e,
             }
+            out_fail["data_freshness_status"] = compute_data_freshness_status(out_fail)
+            return out_fail
         df = cached_ohlcv.value.copy()
         stale = True
 
@@ -423,9 +658,14 @@ async def fetch_live_context(
         freshness = "cached"
 
     indicators = calculate_indicators(df)
-    market = await fetch_market_metrics(symbol)
-    fear_greed = await fetch_fear_greed()
-    news = await fetch_news_sentiment(symbol)
+    market, news, funding_rest, exchange_vol, fear_greed = await _gather_parallel_market_extras(symbol)
+    proxy_pack = _pack_onchain_proxy_fields(
+        market=market,
+        fear_greed=fear_greed,
+        funding_rest=funding_rest,
+        exchange_vol=exchange_vol,
+    )
+    _log_onchain_proxy_pack(proxy_pack)
 
     if market.get("stale_data") is True:
         freshness = "cached" if freshness == "live" else freshness
@@ -452,7 +692,7 @@ async def fetch_live_context(
                 ts_pd = ts_pd.tz_convert("UTC")
             last_ohlcv_candle_utc = ts_pd.strftime("%Y-%m-%d %H:%M UTC")
 
-    return {
+    base: dict[str, Any] = {
         "asset": symbol,
         "timeframe": tf.upper(),
         "updated_at": now_utc.strftime("%Y-%m-%d %H:%M"),
@@ -472,25 +712,95 @@ async def fetch_live_context(
         "data_freshness": freshness,
         "source": market.get("source") or source,
         "stale_data": stale,
+        **proxy_pack,
     }
+    base["data_freshness_status"] = compute_data_freshness_status(base)
+    return base
 
 
-def format_live_context_markdown(ctx: dict[str, Any]) -> str:
-    current_system_time = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
-    time_header = f"CURRENT_SYSTEM_TIME: {current_system_time} UTC\n"
+def compute_data_freshness_status(ctx: dict[str, Any] | None) -> str:
+    """Агрегированный статус для промптов: LIVE | CACHED | STALE | UNAVAILABLE."""
+    if not ctx:
+        return "UNAVAILABLE"
+    preset = ctx.get("data_freshness_status")
+    if preset in ("LIVE", "CACHED", "STALE", "UNAVAILABLE"):
+        return str(preset)
+    if ctx.get("data_freshness") == "unavailable":
+        return "UNAVAILABLE"
+    if ctx.get("price") is None:
+        return "UNAVAILABLE"
+    raw_lc = ctx.get("last_ohlcv_candle_utc")
+    if not raw_lc or not isinstance(raw_lc, str):
+        return "UNAVAILABLE"
+    try:
+        parsed = datetime.strptime(raw_lc.replace(" UTC", "").strip(), "%Y-%m-%d %H:%M").replace(
+            tzinfo=UTC
+        )
+    except ValueError:
+        return "UNAVAILABLE"
+    if datetime.now(UTC) - parsed > timedelta(hours=1):
+        return "STALE"
+    if ctx.get("stale_data") is True:
+        return "STALE"
+    if ctx.get("data_freshness") == "live":
+        return "LIVE"
+    return "CACHED"
 
-    if not ctx or ctx.get("data_freshness") == "unavailable":
+
+def _onchain_proxy_markdown_block(ctx: dict[str, Any]) -> str:
+    """Секция прокси для On-chain Analyst (Binance REST + F&G + спот 24h)."""
+    fr = ctx.get("funding_rate")
+    fg = ctx.get("fear_greed_index")
+    fl = ctx.get("approx_exchange_flow")
+    if not any(isinstance(x, str) and x and x != "Нет данных" for x in (fr, fg, fl)):
+        return ""
+    return (
+        "\n🔬 ONCHAIN_PROXY (бесплатные источники; прокси ликвидности/настроения, не Glassnode):\n"
+        f"- funding_rate: {fr}\n"
+        f"- fear_greed_index: {fg}\n"
+        f"- approx_exchange_flow: {fl}\n"
+    )
+
+
+def format_live_context_markdown(ctx: dict[str, Any] | None) -> str:
+    now_ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
+    status = compute_data_freshness_status(ctx)
+    header = (
+        f"CURRENT_UTC_TIMESTAMP: {now_ts} UTC\n"
+        f"CURRENT_SYSTEM_TIME: {now_ts} UTC\n"
+        f"DATA_FRESHNESS_STATUS: {status}\n"
+    )
+
+    if status in ("STALE", "UNAVAILABLE"):
+        c = ctx or {}
+        asset = c.get("asset") or "Нет данных"
+        tf = c.get("timeframe") or "Нет данных"
+        raw_f = c.get("data_freshness", "unavailable")
+        src = c.get("source", "unknown")
+        last_c = c.get("last_ohlcv_candle_utc") or "Нет данных"
+        updated = c.get("updated_at") or "Нет данных"
+        proxy_block = _onchain_proxy_markdown_block(c)
+        proxy_note = ""
+        if has_actionable_onchain_proxy(c):
+            proxy_note = (
+                "\n(On-chain Analyst при наличии ONCHAIN_PROXY ниже не возвращает PASS из-за статуса свечей; "
+                "остальные роли по-прежнему обязаны следовать DATA_FRESHNESS_STATUS.)\n"
+            )
         return (
-            time_header
-            + "LAST_OHLCV_CANDLE_CLOSE_TIME: Нет данных\n"
-            + "📊 LIVE DATA CONTEXT (Updated: Нет данных)\n"
-            "Asset: Нет данных | Timeframe: Нет данных\n"
+            header
+            + f"LAST_OHLCV_CANDLE_CLOSE_TIME: {last_c}\n"
+            + f"📊 LIVE DATA CONTEXT — вывод по рынку ЗАПРЕЩЁН (DATA_FRESHNESS_STATUS={status})\n"
+            f"Asset: {asset} | Timeframe: {tf}\n"
             "Price: Нет данных | 24h Δ: Нет данных\n"
             "📈 Indicators: RSI(14)=Нет данных, MACD=Нет данных, EMA(20/50)=Нет данных, ATR=Нет данных\n"
             "📉 Market: Funding=Нет данных, Volume(USDT)=Нет данных, OI=Нет данных, Fear&Greed=Нет данных\n"
             "📰 News/Sentiment: Нет данных\n"
-            "Data Freshness: unavailable | Source: unavailable"
+            f"Context snapshot updated_at: {updated} | Data Freshness (raw): {raw_f} | Source: {src}\n"
+            + proxy_note
+            + proxy_block
+            + "(При STALE/UNAVAILABLE технический/сентимент/риск — только PASS; см. ONCHAIN_PROXY для исключения on-chain.)\n"
         )
+
     ind = ctx.get("indicators") or {}
     market = ctx.get("market_metrics") or {}
     fg = ctx.get("fear_greed") or {}
@@ -499,25 +809,10 @@ def format_live_context_markdown(ctx: dict[str, Any]) -> str:
         f"{n.get('title', 'Нет данных')} ({n.get('tone', 'neutral')})" for n in news[:2]
     ) or "Нет данных"
     last_candle = ctx.get("last_ohlcv_candle_utc") or "Нет данных"
-    staleness_hint = ""
-    raw_lc = ctx.get("last_ohlcv_candle_utc")
-    if isinstance(raw_lc, str) and raw_lc not in ("Нет данных", ""):
-        try:
-            parsed = datetime.strptime(raw_lc.replace(" UTC", "").strip(), "%Y-%m-%d %H:%M").replace(
-                tzinfo=UTC
-            )
-            if datetime.now(UTC) - parsed > timedelta(hours=24):
-                staleness_hint = (
-                    "CANDLE_VS_NOW_HINT: последняя свеча старше 24 ч относительно CURRENT_SYSTEM_TIME "
-                    "→ укажи «Данные устарели» в ответе.\n"
-                )
-        except ValueError:
-            pass
 
     return (
-        time_header
+        header
         + f"LAST_OHLCV_CANDLE_CLOSE_TIME: {last_candle}\n"
-        + staleness_hint
         + f"📊 LIVE DATA CONTEXT (Updated: {ctx.get('updated_at')} UTC)\n"
         f"Asset: {ctx.get('asset')} | Timeframe: {ctx.get('timeframe')}\n"
         f"Price: {ctx.get('price', 'Нет данных')} | 24h Δ: {ctx.get('change_24h_pct', 'Нет данных')}%\n"
@@ -529,7 +824,8 @@ def format_live_context_markdown(ctx: dict[str, Any]) -> str:
         f"OI={market.get('open_interest', 'Нет данных')} USD\n"
         f"🧠 Fear & Greed: {fg.get('value', 'Нет данных')} ({fg.get('classification', 'No Data')})\n"
         f"📰 News/Sentiment: {news_summary}\n"
-        f"Data Freshness: {ctx.get('data_freshness', 'cached')} | Source: {ctx.get('source', 'unknown')}"
+        f"{_onchain_proxy_markdown_block(ctx)}"
+        f"Data Freshness (raw): {ctx.get('data_freshness', 'cached')} | Source: {ctx.get('source', 'unknown')}"
     )
 
 

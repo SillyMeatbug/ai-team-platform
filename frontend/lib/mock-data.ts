@@ -63,9 +63,9 @@ export const MOCK_PROJECTS: Project[] = [
       AVAILABLE_AGENTS[4],
     ],
     files: [
-      { id: 'f1', name: 'project-brief.pdf', size: '2.3 MB', type: 'pdf', category: 'brief', uploadedAt: '2024-01-15' },
-      { id: 'f2', name: 'homepage-mockup.png', size: '1.1 MB', type: 'image', category: 'mockup', uploadedAt: '2024-01-15' },
-      { id: 'f3', name: 'brand-guidelines.pdf', size: '4.5 MB', type: 'pdf', category: 'reference', uploadedAt: '2024-01-16' },
+      { id: 'f1', name: 'project-brief.pdf', size: '2.3 MB', type: 'pdf', category: 'brief', uploadedAt: '2026-01-15' },
+      { id: 'f2', name: 'homepage-mockup.png', size: '1.1 MB', type: 'image', category: 'mockup', uploadedAt: '2026-01-15' },
+      { id: 'f3', name: 'brand-guidelines.pdf', size: '4.5 MB', type: 'pdf', category: 'reference', uploadedAt: '2026-01-16' },
     ],
     messages: [
       { id: 'm1', agentId: 'user', content: 'Let\'s start working on the e-commerce project. I need a modern, clean design.', timestamp: '10:00 AM' },
@@ -75,8 +75,8 @@ export const MOCK_PROJECTS: Project[] = [
       { id: 'm5', agentId: 'agent-designer', content: 'For the homepage, I recommend:\n\n1. **Hero section** with featured products carousel\n2. **Category grid** with hover effects\n3. **Best sellers** section\n4. **Newsletter signup** with discount offer\n\nThis follows e-commerce best practices for conversion.', timestamp: '10:12 AM', isGroupDiscussion: true, discussionId: 'disc-1' },
       { id: 'm6', agentId: 'agent-frontend', content: 'I can implement that with Next.js and Tailwind. For the carousel, I\'d suggest using Embla for smooth animations. The category grid can use CSS Grid with `aspect-ratio` for consistent sizing.\n\n```tsx\n<div className="grid grid-cols-2 md:grid-cols-4 gap-4">\n  {categories.map(cat => (\n    <CategoryCard key={cat.id} {...cat} />\n  ))}\n</div>\n```\n\nI\'ll set up the project structure today.', timestamp: '10:15 AM', isGroupDiscussion: true, discussionId: 'disc-1' },
     ],
-    createdAt: '2024-01-15',
-    updatedAt: '2024-01-16',
+    createdAt: '2026-01-15',
+    updatedAt: '2026-01-16',
   },
   {
     id: 'proj-2',
@@ -88,18 +88,18 @@ export const MOCK_PROJECTS: Project[] = [
       AVAILABLE_AGENTS[2],
     ],
     files: [
-      { id: 'f4', name: 'app-screenshots.zip', size: '8.2 MB', type: 'image', category: 'mockup', uploadedAt: '2024-01-10' },
-      { id: 'f5', name: 'competitor-analysis.pdf', size: '1.8 MB', type: 'pdf', category: 'reference', uploadedAt: '2024-01-10' },
-      { id: 'f6', name: 'brand-assets.fig', size: '3.2 MB', type: 'figma', category: 'reference', uploadedAt: '2024-01-11' },
-      { id: 'f7', name: 'copy-draft.docx', size: '45 KB', type: 'doc', category: 'brief', uploadedAt: '2024-01-12' },
-      { id: 'f8', name: 'seo-keywords.txt', size: '12 KB', type: 'text', category: 'reference', uploadedAt: '2024-01-12' },
+      { id: 'f4', name: 'app-screenshots.zip', size: '8.2 MB', type: 'image', category: 'mockup', uploadedAt: '2026-01-10' },
+      { id: 'f5', name: 'competitor-analysis.pdf', size: '1.8 MB', type: 'pdf', category: 'reference', uploadedAt: '2026-01-10' },
+      { id: 'f6', name: 'brand-assets.fig', size: '3.2 MB', type: 'figma', category: 'reference', uploadedAt: '2026-01-11' },
+      { id: 'f7', name: 'copy-draft.docx', size: '45 KB', type: 'doc', category: 'brief', uploadedAt: '2026-01-12' },
+      { id: 'f8', name: 'seo-keywords.txt', size: '12 KB', type: 'text', category: 'reference', uploadedAt: '2026-01-12' },
     ],
     messages: [
       { id: 'm7', agentId: 'user', content: 'We need a high-converting landing page for our fitness app launch.', timestamp: '9:00 AM' },
       { id: 'm8', agentId: 'agent-copywriter', content: 'I\'ll craft compelling copy that highlights the app\'s unique features. Key messages:\n\n- **Personalized workouts** that adapt to your progress\n- **AI-powered form correction** using your phone camera\n- **Community challenges** to stay motivated\n\nWhat\'s our target audience demographic?', timestamp: '9:03 AM' },
     ],
-    createdAt: '2024-01-10',
-    updatedAt: '2024-01-12',
+    createdAt: '2026-01-10',
+    updatedAt: '2026-01-12',
   },
 ]
 
@@ -110,7 +110,7 @@ export const MOCK_RESULTS: AgentResult[] = [
     title: 'Technical Architecture Document',
     category: 'architecture',
     content: '# E-commerce Architecture\n\n## Tech Stack\n- **Frontend**: Next.js 14 with App Router\n- **Styling**: Tailwind CSS\n- **Database**: PostgreSQL with Prisma ORM\n- **Auth**: NextAuth.js\n- **Payments**: Stripe\n- **Hosting**: Vercel\n\n## Key Features\n1. Server-side rendering for SEO\n2. Edge caching for product pages\n3. Real-time inventory updates\n4. Webhook integration for order processing',
-    createdAt: '2024-01-16',
+    createdAt: '2026-01-16',
   },
   {
     id: 'res-2',
@@ -118,7 +118,7 @@ export const MOCK_RESULTS: AgentResult[] = [
     title: 'Homepage Wireframe',
     category: 'design',
     content: '# Homepage Layout\n\n## Sections\n1. **Navigation** - Sticky header with search, cart, account\n2. **Hero** - Full-width carousel with CTA buttons\n3. **Categories** - 4-column grid with hover effects\n4. **Featured Products** - Horizontal scroll on mobile\n5. **Testimonials** - Customer reviews carousel\n6. **Footer** - Links, newsletter, social media',
-    createdAt: '2024-01-16',
+    createdAt: '2026-01-16',
   },
   {
     id: 'res-3',
@@ -126,7 +126,7 @@ export const MOCK_RESULTS: AgentResult[] = [
     title: 'Component Library Setup',
     category: 'code',
     content: '```tsx\n// components/ui/ProductCard.tsx\nexport function ProductCard({ product }: { product: Product }) {\n  return (\n    <div className="group relative rounded-lg border p-4 hover:shadow-lg">\n      <Image\n        src={product.image}\n        alt={product.name}\n        className="aspect-square object-cover"\n      />\n      <h3 className="mt-2 font-medium">{product.name}</h3>\n      <p className="text-muted-foreground">${product.price}</p>\n      <Button className="mt-2 w-full">Add to Cart</Button>\n    </div>\n  )\n}\n```',
-    createdAt: '2024-01-16',
+    createdAt: '2026-01-16',
   },
   {
     id: 'res-4',
@@ -134,7 +134,7 @@ export const MOCK_RESULTS: AgentResult[] = [
     title: 'Homepage Copy',
     category: 'content',
     content: '# Homepage Copy\n\n## Hero Section\n**Headline**: "Fresh, Organic, Delivered"\n**Subheadline**: "Discover premium organic products sourced directly from local farms"\n**CTA**: "Shop Now" | "Learn Our Story"\n\n## Value Props\n- 100% Certified Organic\n- Free Delivery Over $50\n- Sustainable Packaging\n- Support Local Farmers',
-    createdAt: '2024-01-16',
+    createdAt: '2026-01-16',
   },
 ]
 

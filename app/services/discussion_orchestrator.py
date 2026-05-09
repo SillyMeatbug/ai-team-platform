@@ -36,12 +36,21 @@ from app.models.database import (
     ProjectFile,
 )
 from app.services.dispatcher import complete_chat_messages
-from app.services.market_data import fetch_live_context, format_live_context_markdown
+from app.services.market_data import (
+    compute_data_freshness_status,
+    fetch_live_context,
+    format_live_context_markdown,
+    has_actionable_onchain_proxy,
+)
 from app.services.paper_trading import record_trade_from_signal
 from app.services.project_file_contents import prepare_chat_attachment_sections
 
 logger = logging.getLogger(__name__)
 
+# Кэш fetch_live_context по asset|timeframe внутри процесса (TTL короче TTL свечей — только чтобы не дублировать запросы в одном ходе чата).
+_ORCH_MC_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_ORCH_MC_CACHE_LOCK = asyncio.Lock()
+_ORCH_MC_CACHE_TTL_S = 45.0
 
 _MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_\- ]{1,80})")
 _NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
@@ -108,6 +117,56 @@ _RISK_MANAGER_FALLBACK_TEXT = (
     "Риск-расчёт временно недоступен."
 )
 _MAX_TARGET_AGENTS = 5
+
+_PAIR_FROM_MESSAGE_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9]{1,14})/(USDT|USDC|USD|BUSD)\b",
+)
+_BASE_TICKER_FROM_MESSAGE_RE = re.compile(
+    r"\b(BTC|ETH|SOL|XRP|BNB|DOGE|ADA|DOT|AVAX|LINK|TON|MATIC|POL|TRX|LTC|BCH|NEAR|ATOM|APT|SUI|OP|ARB)\b",
+    re.I,
+)
+_TF_FROM_MESSAGE_RE = re.compile(
+    r"\b(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w|1M)\b",
+    re.I,
+)
+
+
+def resolve_market_params_for_chat(
+    user_message: str,
+    *,
+    explicit_asset: str | None,
+    explicit_timeframe: str | None,
+    targets_include_crypto_agent: bool,
+) -> tuple[str | None, str | None]:
+    """Поля из API имеют приоритет; иначе вытаскиваем пару/ТФ из текста чата.
+
+    Если в очереди есть крипто-роли, а актив не указан ни в API, ни в тексте — подставляем BTC/USDT,
+    иначе `_resolve_market_context` получает asset=None и LIVE DATA не загружается (вечный PASS).
+    """
+    ea = (explicit_asset or "").strip() or None
+    et = (explicit_timeframe or "").strip() or None
+    msg = user_message or ""
+
+    inferred_asset: str | None = None
+    inferred_tf: str | None = None
+
+    pair_m = _PAIR_FROM_MESSAGE_RE.search(msg)
+    if pair_m:
+        inferred_asset = f"{pair_m.group(1).upper()}/{pair_m.group(2).upper()}"
+    else:
+        bm = _BASE_TICKER_FROM_MESSAGE_RE.search(msg)
+        if bm:
+            inferred_asset = f"{bm.group(1).upper()}/USDT"
+
+    tf_m = _TF_FROM_MESSAGE_RE.search(msg)
+    if tf_m:
+        inferred_tf = tf_m.group(1).lower()
+
+    out_a = ea or inferred_asset
+    out_t = et or inferred_tf
+    if targets_include_crypto_agent and not out_a:
+        out_a = "BTC/USDT"
+    return out_a, out_t
 
 
 def _parse_json_object_from_llm(raw: str) -> dict[str, Any] | None:
@@ -241,9 +300,44 @@ def _resolve_mentioned(agents: list[Agent], text: str) -> list[Agent]:
     return out
 
 
+_CRYPTO_PASS_NO_DATA = (
+    "⛔ PASS: Нет актуальных данных для анализа. Не используй исторические примеры."
+)
+
+_CRYPTO_FAIL_LOUD_ROLES = frozenset(
+    {
+        "technical_analyst",
+        "onchain_analyst",
+        "sentiment_analyst",
+        "risk_manager",
+        "crypto_interpreter",
+    }
+)
+
+
+def _crypto_live_data_blocked(
+    market_context: dict[str, Any] | None,
+    *,
+    agent_role: str | None = None,
+) -> bool:
+    # On-chain: не блокировать LLM, если в контексте есть флаг или любые рабочие строки прокси.
+    if agent_role == "onchain_analyst":
+        mc = market_context or {}
+        if mc.get("onchain_proxy_ok") is True:
+            return False
+        if has_actionable_onchain_proxy(mc):
+            return False
+    if market_context is None:
+        return True
+    return compute_data_freshness_status(market_context) in ("STALE", "UNAVAILABLE")
+
+
 def _is_pass_response(text: str | None) -> bool:
-    s = (text or "").strip().lower()
-    return s.startswith("pass: not my expertise")
+    raw = (text or "").strip()
+    ls = raw.lower()
+    if ls.startswith("⛔ pass") or "нет актуальных данных" in ls:
+        return True
+    return ls.startswith("pass: not my expertise") or ls.startswith("pass: не моя")
 
 
 def _is_ui_question(text: str) -> bool:
@@ -695,7 +789,7 @@ def _is_deadline_exceeded(deadline: datetime | None) -> bool:
 class DiscussionOrchestrator:
     """Координатор последовательной дискуссии агентов в проекте."""
 
-    __slots__ = ("_session", "_settings", "_http_client", "_file_storage")
+    __slots__ = ("_session", "_settings", "_http_client", "_file_storage", "_session_lock")
 
     def __init__(
         self,
@@ -709,6 +803,7 @@ class DiscussionOrchestrator:
         self._settings = settings
         self._http_client = http_client
         self._file_storage = file_storage
+        self._session_lock = asyncio.Lock()
 
     async def _load_project(self, project_id: str) -> Project:
         proj = await self._session.get(Project, project_id)
@@ -773,6 +868,16 @@ class DiscussionOrchestrator:
     ) -> dict[str, Any] | None:
         if not asset:
             return None
+        tf = (timeframe or "4H").strip().upper()
+        sym = (asset or "").strip().upper()
+        cache_key = f"{sym}|{tf}"
+        loop_t = asyncio.get_running_loop().time()
+        async with _ORCH_MC_CACHE_LOCK:
+            hit = _ORCH_MC_CACHE.get(cache_key)
+            if hit and loop_t - hit[0] < _ORCH_MC_CACHE_TTL_S:
+                cached = hit[1]
+                return dict(cached) if isinstance(cached, dict) else cached
+
         try:
             ctx = await fetch_live_context(asset=asset, timeframe=timeframe or "4H")
             log_payload(
@@ -783,8 +888,12 @@ class DiscussionOrchestrator:
                 asset=ctx.get("asset"),
                 timeframe=ctx.get("timeframe"),
                 data_freshness=ctx.get("data_freshness"),
+                data_freshness_status=ctx.get("data_freshness_status"),
                 source=ctx.get("source"),
             )
+            stored_at = asyncio.get_running_loop().time()
+            async with _ORCH_MC_CACHE_LOCK:
+                _ORCH_MC_CACHE[cache_key] = (stored_at, dict(ctx))
             return ctx
         except Exception as e:
             log_payload(
@@ -796,12 +905,18 @@ class DiscussionOrchestrator:
                 timeframe=timeframe,
                 error=f"{type(e).__name__}",
             )
+            now_u = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
             return {
                 "asset": asset,
                 "timeframe": (timeframe or "4H").upper(),
+                "updated_at": now_u,
+                "current_system_time_utc": now_u,
+                "last_ohlcv_candle_utc": None,
                 "data_freshness": "unavailable",
                 "source": "unavailable",
                 "stale_data": True,
+                "data_freshness_status": "UNAVAILABLE",
+                "price": None,
             }
 
     async def _prepare_attachments_for_agent_turn(
@@ -886,25 +1001,26 @@ class DiscussionOrchestrator:
         is_discussion: bool,
         parent_id: str,
     ) -> ChatMessage:
-        project = await self._session.get(Project, project_id)
-        if project is not None:
-            project.updated_at = datetime.now(UTC)
-        msg = ChatMessage(
-            id=str(uuid.uuid4()),
-            project_id=project_id,
-            sender_type="agent",
-            sender_id=agent.id if agent else None,
-            content=content or "",
-            timestamp=datetime.now(UTC),
-            is_discussion=is_discussion,
-            parent_message_id=parent_id,
-            error=error,
-            attachment_file_ids=[],
-        )
-        self._session.add(msg)
-        await self._session.commit()
-        await self._session.refresh(msg)
-        return msg
+        async with self._session_lock:
+            project = await self._session.get(Project, project_id)
+            if project is not None:
+                project.updated_at = datetime.now(UTC)
+            msg = ChatMessage(
+                id=str(uuid.uuid4()),
+                project_id=project_id,
+                sender_type="agent",
+                sender_id=agent.id if agent else None,
+                content=content or "",
+                timestamp=datetime.now(UTC),
+                is_discussion=is_discussion,
+                parent_message_id=parent_id,
+                error=error,
+                attachment_file_ids=[],
+            )
+            self._session.add(msg)
+            await self._session.commit()
+            await self._session.refresh(msg)
+            return msg
 
     async def _maybe_record_paper_trade(
         self,
@@ -921,15 +1037,16 @@ class DiscussionOrchestrator:
         asset = (market_asset or "").strip() or "BTC/USDT"
         timeframe = (market_timeframe or "").strip() or "4H"
         try:
-            await record_trade_from_signal(
-                self._session,
-                project_id=project_id,
-                agent=agent,
-                content=content,
-                asset=asset,
-                timeframe=timeframe,
-                market_context=market_context,
-            )
+            async with self._session_lock:
+                await record_trade_from_signal(
+                    self._session,
+                    project_id=project_id,
+                    agent=agent,
+                    content=content,
+                    asset=asset,
+                    timeframe=timeframe,
+                    market_context=market_context,
+                )
         except Exception as e:
             log_payload(
                 logger,
@@ -1835,6 +1952,15 @@ class DiscussionOrchestrator:
         debate_locale: str | None = None,
         market_context: dict[str, Any] | None = None,
     ) -> _AgentTurnResult:
+        if agent.role in _CRYPTO_AGENT_ROLES:
+            _st = compute_data_freshness_status(market_context)
+            _ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+            logger.info("Context for %s: freshness=%s, time=%s", agent.role, _st, _ts)
+        if agent.role in _CRYPTO_FAIL_LOUD_ROLES and _crypto_live_data_blocked(
+            market_context, agent_role=agent.role
+        ):
+            return _AgentTurnResult(agent=agent, content=_CRYPTO_PASS_NO_DATA, error=None)
+
         if self._settings.aggregate_mock_providers or self._http_client is None:
             content = _mock_agent_reply(
                 agent=agent,
@@ -1843,55 +1969,44 @@ class DiscussionOrchestrator:
             )
             return _AgentTurnResult(agent=agent, content=content, error=None)
 
-        attach_text, attach_images = await self._prepare_attachments_for_agent_turn(
-            project_id=project.id,
-            project_files=files,
-            agent=agent,
-            request_id=request_id,
-        )
-        model_id = (agent.model or "").strip() or _DEFAULT_OPENROUTER_MODEL
-        include_images = attach_images if _model_supports_images(model_id) else []
-        if attach_images and not include_images:
-            log_payload(
-                logger,
-                logging.INFO,
-                "chat_attachments_images_skipped",
-                request_id=request_id,
+        async with self._session_lock:
+            attach_text, attach_images = await self._prepare_attachments_for_agent_turn(
                 project_id=project.id,
-                agent_id=agent.id,
-                model=model_id,
-                skipped_images=len(attach_images),
-            )
-
-        messages = build_agent_prompt(
-            agent=agent,
-            project=project,
-            files=files,
-            history=history,
-            agents_by_id=agents_by_id,
-            team_agents=team_agents,
-            user_message=user_message_text,
-            previous_responses=previous_responses,
-            file_attachments_text=attach_text,
-            file_attachments_images=include_images,
-            debate_round=debate_round,
-            debate_total_rounds=debate_total_rounds,
-            debate_locale=debate_locale,
-            market_context_markdown=format_live_context_markdown(market_context)
-            if market_context
-            else None,
-        )
-        if market_context and agent.role in _CRYPTO_AGENT_ROLES:
-            log_payload(
-                logger,
-                logging.INFO,
-                "agent_live_data_context",
+                project_files=files,
+                agent=agent,
                 request_id=request_id,
-                agent_id=agent.id,
-                agent_role=agent.role,
-                data_freshness=market_context.get("data_freshness"),
-                source=market_context.get("source"),
-                live_context=format_live_context_markdown(market_context),
+            )
+            model_id = (agent.model or "").strip() or _DEFAULT_OPENROUTER_MODEL
+            include_images = attach_images if _model_supports_images(model_id) else []
+            if attach_images and not include_images:
+                log_payload(
+                    logger,
+                    logging.INFO,
+                    "chat_attachments_images_skipped",
+                    request_id=request_id,
+                    project_id=project.id,
+                    agent_id=agent.id,
+                    model=model_id,
+                    skipped_images=len(attach_images),
+                )
+
+            messages = build_agent_prompt(
+                agent=agent,
+                project=project,
+                files=files,
+                history=history,
+                agents_by_id=agents_by_id,
+                team_agents=team_agents,
+                user_message=user_message_text,
+                previous_responses=previous_responses,
+                file_attachments_text=attach_text,
+                file_attachments_images=include_images,
+                debate_round=debate_round,
+                debate_total_rounds=debate_total_rounds,
+                debate_locale=debate_locale,
+                market_context_markdown=format_live_context_markdown(market_context)
+                if market_context
+                else None,
             )
         route = _resolve_route_for_agent(agent)
         try:
@@ -1953,6 +2068,16 @@ class DiscussionOrchestrator:
         market_context: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         """Дельты текста из OpenRouter stream=True (yield сразу по приходу SSE)."""
+        if agent.role in _CRYPTO_AGENT_ROLES:
+            _st = compute_data_freshness_status(market_context)
+            _ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+            logger.info("Context for %s: freshness=%s, time=%s", agent.role, _st, _ts)
+        if agent.role in _CRYPTO_FAIL_LOUD_ROLES and _crypto_live_data_blocked(
+            market_context, agent_role=agent.role
+        ):
+            yield _CRYPTO_PASS_NO_DATA
+            return
+
         if self._settings.aggregate_mock_providers or self._http_client is None:
             content = _mock_agent_reply(
                 agent=agent,
@@ -1963,32 +2088,33 @@ class DiscussionOrchestrator:
                 yield content
             return
 
-        attach_text, attach_images = await self._prepare_attachments_for_agent_turn(
-            project_id=project.id,
-            project_files=files,
-            agent=agent,
-            request_id=request_id,
-        )
-        model_id = (agent.model or "").strip() or _DEFAULT_OPENROUTER_MODEL
-        include_images = attach_images if _model_supports_images(model_id) else []
-        messages = build_agent_prompt(
-            agent=agent,
-            project=project,
-            files=files,
-            history=history,
-            agents_by_id=agents_by_id,
-            team_agents=team_agents,
-            user_message=user_message_text,
-            previous_responses=previous_responses,
-            file_attachments_text=attach_text,
-            file_attachments_images=include_images,
-            debate_round=debate_round,
-            debate_total_rounds=debate_total_rounds,
-            debate_locale=debate_locale,
-            market_context_markdown=format_live_context_markdown(market_context)
-            if market_context
-            else None,
-        )
+        async with self._session_lock:
+            attach_text, attach_images = await self._prepare_attachments_for_agent_turn(
+                project_id=project.id,
+                project_files=files,
+                agent=agent,
+                request_id=request_id,
+            )
+            model_id = (agent.model or "").strip() or _DEFAULT_OPENROUTER_MODEL
+            include_images = attach_images if _model_supports_images(model_id) else []
+            messages = build_agent_prompt(
+                agent=agent,
+                project=project,
+                files=files,
+                history=history,
+                agents_by_id=agents_by_id,
+                team_agents=team_agents,
+                user_message=user_message_text,
+                previous_responses=previous_responses,
+                file_attachments_text=attach_text,
+                file_attachments_images=include_images,
+                debate_round=debate_round,
+                debate_total_rounds=debate_total_rounds,
+                debate_locale=debate_locale,
+                market_context_markdown=format_live_context_markdown(market_context)
+                if market_context
+                else None,
+            )
 
         async def _iter_stream_for_model(model_to_use: str) -> AsyncIterator[str]:
             payload: dict[str, Any] = {
@@ -2086,9 +2212,16 @@ class DiscussionOrchestrator:
         if resolved_locale not in ("en", "ru"):
             resolved_locale = "en"
         previous_responses: list[tuple[Agent, str]] = []
+        targets_need_crypto = any(a.role in _CRYPTO_AGENT_ROLES for a in targets)
+        eff_asset, eff_tf = resolve_market_params_for_chat(
+            user_content,
+            explicit_asset=market_asset,
+            explicit_timeframe=market_timeframe,
+            targets_include_crypto_agent=targets_need_crypto,
+        )
         market_context = await self._resolve_market_context(
-            asset=market_asset,
-            timeframe=market_timeframe,
+            asset=eff_asset,
+            timeframe=eff_tf,
             request_id=request_id,
         )
 
@@ -2165,8 +2298,8 @@ class DiscussionOrchestrator:
                     project_id=project.id,
                     agent=agent,
                     content=saved.content,
-                    market_asset=market_asset,
-                    market_timeframe=market_timeframe,
+                    market_asset=eff_asset,
+                    market_timeframe=eff_tf,
                     market_context=market_context,
                 )
             yield {"type": "agent_done", "agent_id": agent.id, "error": stream_err}
@@ -2349,28 +2482,24 @@ class DiscussionOrchestrator:
         market_asset: str | None = None,
         market_timeframe: str | None = None,
     ) -> tuple[int, list[str]]:
-        """Последовательные ответы: каждый следующий видит ответы предыдущих."""
+        """Ответы агентов: цепочка с видимостью предыдущих реплик; Risk Manager — параллельно остальным."""
         agents_by_id = {a.id: a for a in all_agents}
         ordered = list(targets)[:_MAX_TARGET_AGENTS]
         response_order = [a.id for a in ordered]
         deadline = datetime.now(UTC) + timedelta(
             milliseconds=min(self._settings.chat_response_timeout_ms * 4, 120_000)
         )
-        previous_responses: list[tuple[Agent, str]] = []
-        saved_count = 0
-        pass_turns: list[_AgentTurnResult] = []
+        non_risk = [a for a in ordered if a.role != "risk_manager"]
+        risk_only = [a for a in ordered if a.role == "risk_manager"]
 
-        for agent in ordered:
-            now = datetime.now(UTC)
-            if now >= deadline:
-                break
-            remaining_s = max(1.0, (deadline - now).total_seconds())
-            per_agent_timeout_s = min(
-                remaining_s,
-                max(8.0, min(25.0, self._settings.chat_response_timeout_ms / 1000)),
-            )
+        async def _one_turn(
+            *,
+            agent: Agent,
+            prev_chain: list[tuple[Agent, str]],
+            per_agent_timeout_s: float,
+        ) -> _AgentTurnResult:
             try:
-                turn = await asyncio.wait_for(
+                return await asyncio.wait_for(
                     self._agent_turn(
                         agent=agent,
                         project=project,
@@ -2379,7 +2508,7 @@ class DiscussionOrchestrator:
                         agents_by_id=agents_by_id,
                         team_agents=all_agents,
                         user_message_text=user_content,
-                        previous_responses=previous_responses,
+                        previous_responses=prev_chain,
                         temperature=temperature,
                         request_id=request_id,
                         market_context=market_context,
@@ -2387,16 +2516,15 @@ class DiscussionOrchestrator:
                     timeout=per_agent_timeout_s,
                 )
             except TimeoutError:
-                turn = _AgentTurnResult(
+                return _AgentTurnResult(
                     agent=agent,
                     content=None,
                     error="sequential_timeout",
                 )
 
+        async def _persist_turn(turn: _AgentTurnResult) -> ChatMessage | None:
             if _is_pass_response(turn.content):
-                pass_turns.append(turn)
-                continue
-
+                return None
             saved = await self._save_agent_message(
                 project_id=project.id,
                 agent=turn.agent,
@@ -2405,10 +2533,7 @@ class DiscussionOrchestrator:
                 is_discussion=is_discussion,
                 parent_id=user_message_id,
             )
-            saved_count += 1
             if turn.content:
-                previous_responses.append((agent, turn.content))
-                history.append(saved)
                 await self._maybe_record_paper_trade(
                     project_id=project.id,
                     agent=turn.agent,
@@ -2417,7 +2542,6 @@ class DiscussionOrchestrator:
                     market_timeframe=market_timeframe,
                     market_context=market_context,
                 )
-
             log_payload(
                 logger,
                 logging.INFO,
@@ -2429,7 +2553,107 @@ class DiscussionOrchestrator:
                 ok=turn.error is None,
                 error=turn.error,
             )
+            return saved
 
+        if not risk_only:
+            previous_responses: list[tuple[Agent, str]] = []
+            saved_count = 0
+            pass_turns: list[_AgentTurnResult] = []
+
+            for agent in ordered:
+                now = datetime.now(UTC)
+                if now >= deadline:
+                    break
+                remaining_s = max(1.0, (deadline - now).total_seconds())
+                per_agent_timeout_s = min(
+                    remaining_s,
+                    max(8.0, min(25.0, self._settings.chat_response_timeout_ms / 1000)),
+                )
+                turn = await _one_turn(
+                    agent=agent,
+                    prev_chain=previous_responses,
+                    per_agent_timeout_s=per_agent_timeout_s,
+                )
+                if _is_pass_response(turn.content):
+                    pass_turns.append(turn)
+                    continue
+                saved = await _persist_turn(turn)
+                if saved is not None:
+                    saved_count += 1
+                    previous_responses.append((agent, turn.content or ""))
+                    history.append(saved)
+
+            if saved_count == 0 and pass_turns:
+                first = pass_turns[0]
+                await self._save_agent_message(
+                    project_id=project.id,
+                    agent=first.agent,
+                    content=first.content,
+                    error=first.error,
+                    is_discussion=is_discussion,
+                    parent_id=user_message_id,
+                )
+                saved_count = 1
+
+            return saved_count, response_order
+
+        previous_responses_nr: list[tuple[Agent, str]] = []
+        pass_turns: list[_AgentTurnResult] = []
+        saved_nr = 0
+        saved_rm = 0
+
+        async def non_risk_worker() -> None:
+            nonlocal saved_nr
+            for agent in non_risk:
+                now = datetime.now(UTC)
+                if now >= deadline:
+                    break
+                remaining_s = max(1.0, (deadline - now).total_seconds())
+                per_agent_timeout_s = min(
+                    remaining_s,
+                    max(8.0, min(25.0, self._settings.chat_response_timeout_ms / 1000)),
+                )
+                turn = await _one_turn(
+                    agent=agent,
+                    prev_chain=previous_responses_nr,
+                    per_agent_timeout_s=per_agent_timeout_s,
+                )
+                if _is_pass_response(turn.content):
+                    pass_turns.append(turn)
+                    continue
+                saved = await _persist_turn(turn)
+                if saved is not None:
+                    saved_nr += 1
+                    previous_responses_nr.append((agent, turn.content or ""))
+                    history.append(saved)
+
+        async def risk_worker() -> None:
+            nonlocal saved_rm
+            for agent in risk_only:
+                now = datetime.now(UTC)
+                if now >= deadline:
+                    break
+                remaining_s = max(1.0, (deadline - now).total_seconds())
+                per_agent_timeout_s = min(
+                    remaining_s,
+                    max(8.0, min(25.0, self._settings.chat_response_timeout_ms / 1000)),
+                )
+                turn = await _one_turn(
+                    agent=agent,
+                    prev_chain=[],
+                    per_agent_timeout_s=per_agent_timeout_s,
+                )
+                if _is_pass_response(turn.content):
+                    pass_turns.append(turn)
+                    continue
+                saved = await _persist_turn(turn)
+                if saved is not None:
+                    saved_rm += 1
+                    history.append(saved)
+
+        await asyncio.gather(non_risk_worker(), risk_worker())
+
+        saved_count = saved_nr + saved_rm
         if saved_count == 0 and pass_turns:
             first = pass_turns[0]
             await self._save_agent_message(
@@ -2590,9 +2814,26 @@ class DiscussionOrchestrator:
         resolved_locale = (locale or "en").strip().lower()
         if resolved_locale not in ("en", "ru"):
             resolved_locale = "en"
+        targets_need_crypto = any(a.role in _CRYPTO_AGENT_ROLES for a in targets)
+        eff_asset, eff_tf = resolve_market_params_for_chat(
+            user_message,
+            explicit_asset=market_asset,
+            explicit_timeframe=market_timeframe,
+            targets_include_crypto_agent=targets_need_crypto,
+        )
+        if targets_need_crypto:
+            log_payload(
+                logger,
+                logging.INFO,
+                "chat_market_inference",
+                project_id=project.id,
+                resolved_asset=eff_asset,
+                resolved_timeframe=eff_tf,
+                explicit_asset=(market_asset or "").strip() or None,
+            )
         market_context = await self._resolve_market_context(
-            asset=market_asset,
-            timeframe=market_timeframe,
+            asset=eff_asset,
+            timeframe=eff_tf,
             request_id=str(uuid.uuid4()),
         )
 
@@ -2668,8 +2909,8 @@ class DiscussionOrchestrator:
             router_reason=router_reason,
             router_flow=router_flow,
             off_chain_style=off_chain_style,
-            market_asset=market_asset,
-            market_timeframe=market_timeframe,
+            market_asset=eff_asset,
+            market_timeframe=eff_tf,
             data_freshness=(market_context or {}).get("data_freshness"),
             source=(market_context or {}).get("source"),
             market_context=market_context,
@@ -2731,9 +2972,16 @@ class DiscussionOrchestrator:
         resolved_locale = (locale or "en").strip().lower()
         if resolved_locale not in ("en", "ru"):
             resolved_locale = "en"
+        targets_need_crypto = any(a.role in _CRYPTO_AGENT_ROLES for a in targets)
+        eff_asset, eff_tf = resolve_market_params_for_chat(
+            user_content,
+            explicit_asset=market_asset,
+            explicit_timeframe=market_timeframe,
+            targets_include_crypto_agent=targets_need_crypto,
+        )
         market_context = await self._resolve_market_context(
-            asset=market_asset,
-            timeframe=market_timeframe,
+            asset=eff_asset,
+            timeframe=eff_tf,
             request_id=request_id,
         )
 
@@ -2797,8 +3045,8 @@ class DiscussionOrchestrator:
                 request_id=request_id,
                 is_discussion=is_discussion,
                 market_context=market_context,
-                market_asset=market_asset,
-                market_timeframe=market_timeframe,
+                market_asset=eff_asset,
+                market_timeframe=eff_tf,
             )
             log_payload(
                 logger,
@@ -2850,8 +3098,8 @@ class DiscussionOrchestrator:
                 project_id=project.id,
                 agent=turn.agent,
                 content=turn.content,
-                market_asset=market_asset,
-                market_timeframe=market_timeframe,
+                market_asset=eff_asset,
+                market_timeframe=eff_tf,
                 market_context=market_context,
             )
             saved_count += 1

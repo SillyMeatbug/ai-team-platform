@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.agent_library_router import router as agent_library_router
 from app.api.chat_router import router as chat_router
+from app.api.debug_router import router as debug_router
 from app.api.files_router import router as files_router
 from app.api.metrics_router import router as metrics_router
 from app.api.market_router import router as market_router
@@ -63,6 +64,7 @@ app.include_router(projects_router, prefix="/v1")
 app.include_router(files_router, prefix="/v1")
 app.include_router(agent_library_router, prefix="/v1")
 app.include_router(chat_router, prefix="/v1")
+app.include_router(debug_router, prefix="/v1")
 app.include_router(market_router, prefix="/v1/market")
 app.include_router(metrics_router)
 

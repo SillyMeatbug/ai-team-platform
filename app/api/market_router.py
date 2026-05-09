@@ -6,7 +6,11 @@ import time
 import httpx
 from fastapi import APIRouter, Query
 
-from app.services.market_data import fetch_live_context, get_ohlcv_cache_info
+from app.services.market_data import (
+    compute_data_freshness_status,
+    fetch_live_context,
+    get_ohlcv_cache_info,
+)
 
 router = APIRouter(tags=["market"])
 
@@ -22,6 +26,7 @@ async def get_market_context(
     except Exception as e:
         return {
             "status": "unavailable",
+            "data_freshness_status": "UNAVAILABLE",
             "source": "unavailable",
             "timestamp": datetime.now(UTC).isoformat(),
             "asset": asset,
@@ -63,8 +68,10 @@ async def get_market_context(
         if titles:
             brief = " | ".join(titles)
 
+    dfs = ctx.get("data_freshness_status") or compute_data_freshness_status(ctx)
     return {
         "status": ctx.get("data_freshness", "unavailable"),
+        "data_freshness_status": dfs,
         "source": ctx.get("source", "unknown"),
         "timestamp": datetime.now(UTC).isoformat(),
         "asset": ctx.get("asset", asset),
