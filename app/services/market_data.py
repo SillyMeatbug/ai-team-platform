@@ -121,6 +121,125 @@ def _to_binance_symbol(symbol: str) -> str:
     return s.replace("/", "")
 
 
+def _to_okx_inst_id(symbol: str) -> str:
+    """BTC/USDT → BTC-USDT для OKX public REST."""
+    s = (symbol or "").strip().upper().replace("-", "/")
+    if "/" in s:
+        a, b = s.split("/", 1)
+        return f"{a}-{b}"
+    return "BTC-USDT"
+
+
+async def _http_get_json(url: str, *, params: dict[str, Any] | None = None) -> Any:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, params=params or {})
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _fetch_funding_rate_bybit_rest(symbol_ccxt: str) -> dict[str, Any]:
+    sym = _to_binance_symbol(symbol_ccxt)
+    if not sym:
+        return {}
+    js = await _http_get_json(
+        "https://api.bybit.com/v5/market/tickers",
+        params={"category": "linear", "symbol": sym},
+    )
+    lst = ((js.get("result") or {}).get("list") or []) if isinstance(js, dict) else []
+    if not lst or not isinstance(lst[0], dict):
+        return {}
+    row = lst[0]
+    fr = row.get("fundingRate")
+    if fr is None:
+        return {}
+    return {"lastFundingRate": str(fr), "symbol": sym, "source": "bybit_linear"}
+
+
+async def _fetch_exchange_volumes_bybit_spot_rest(symbol_ccxt: str) -> dict[str, Any]:
+    sym = _to_binance_symbol(symbol_ccxt)
+    if not sym:
+        return {}
+    js = await _http_get_json(
+        "https://api.bybit.com/v5/market/tickers",
+        params={"category": "spot", "symbol": sym},
+    )
+    lst = ((js.get("result") or {}).get("list") or []) if isinstance(js, dict) else []
+    if not lst or not isinstance(lst[0], dict):
+        return {}
+    row = lst[0]
+    turnover = float(row.get("turnover24h") or 0)
+    if turnover <= 0:
+        return {}
+    buy_ratio = row.get("buyRatio")
+    ratio = None
+    if buy_ratio is not None:
+        try:
+            ratio = float(buy_ratio)
+        except (TypeError, ValueError):
+            ratio = None
+    return {
+        "quote_volume_24h": turnover,
+        "taker_buy_quote_share": ratio,
+        "symbol": sym,
+        "source": "bybit_spot_24hr",
+    }
+
+
+async def _fetch_exchange_volumes_okx_rest(symbol_ccxt: str) -> dict[str, Any]:
+    inst = _to_okx_inst_id(symbol_ccxt)
+    js = await _http_get_json(
+        "https://www.okx.com/api/v5/market/ticker",
+        params={"instId": inst},
+    )
+    data = (js.get("data") or []) if isinstance(js, dict) else []
+    if not data or not isinstance(data[0], dict):
+        return {}
+    row = data[0]
+    qv = float(row.get("volCcy24h") or 0)
+    if qv <= 0:
+        return {}
+    return {
+        "quote_volume_24h": qv,
+        "taker_buy_quote_volume_24h": None,
+        "taker_buy_quote_share": None,
+        "symbol": inst.replace("-", ""),
+        "source": "okx_spot_24hr",
+    }
+
+
+async def _bybit_linear_metrics_rest(symbol_ccxt: str) -> dict[str, Any]:
+    """Фьючерсный тикер Bybit (обход блокировок Binance с EU IP)."""
+    sym = _to_binance_symbol(symbol_ccxt)
+    if not sym:
+        raise ValueError("empty_symbol")
+    js = await _http_get_json(
+        "https://api.bybit.com/v5/market/tickers",
+        params={"category": "linear", "symbol": sym},
+    )
+    lst = ((js.get("result") or {}).get("list") or []) if isinstance(js, dict) else []
+    if not lst or not isinstance(lst[0], dict):
+        raise ValueError("bybit_linear_empty")
+    row = lst[0]
+    fr_raw = row.get("fundingRate")
+    fr_dec = float(fr_raw or 0.0)
+    turnover = float(row.get("turnover24h") or 0.0)
+    base_vol = float(row.get("volume24h") or 0.0)
+    oi = row.get("openInterestValue") or row.get("openInterest") or 0
+    try:
+        oi_f = float(oi or 0.0)
+    except (TypeError, ValueError):
+        oi_f = 0.0
+    return {
+        "funding_rate": fr_dec * 100.0,
+        "quote_volume": turnover,
+        "base_volume": base_vol,
+        "open_interest": oi_f,
+        "long_short_ratio": None,
+        "liquidations_proxy_ratio": None,
+        "source": "bybit_linear_rest",
+    }
+
+
 def _normalize_fear_greed_from_index_payload(payload: Any) -> dict[str, Any]:
     """Разбор ответа Alternative.me FNG (сырой JSON)."""
     if not isinstance(payload, dict):
@@ -143,21 +262,33 @@ def _normalize_fear_greed_from_index_payload(payload: Any) -> dict[str, Any]:
 
 
 async def fetch_funding_rate(symbol: str) -> dict[str, Any]:
-    """Последняя ставка фандинга Binance USDT-M (`premiumIndex`). Бесплатно, без ключей."""
-    sym = _to_binance_symbol(symbol)
-    if not sym:
+    """Ставка фандинга: Binance USDT-M, при 451/geo — Bybit linear REST."""
+    sym = normalize_ccxt_symbol(symbol)
+    bsym = _to_binance_symbol(sym)
+    if not bsym:
         return {}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 "https://fapi.binance.com/fapi/v1/premiumIndex",
-                params={"symbol": sym},
+                params={"symbol": bsym},
             )
             resp.raise_for_status()
             data = resp.json()
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            data.setdefault("source", "binance_usdm")
+            return data
     except Exception as e:
-        logger.warning("fetch_funding_rate_failed", extra={"symbol": sym, "error": type(e).__name__})
+        logger.warning(
+            "fetch_funding_rate_binance_failed", extra={"symbol": bsym, "error": type(e).__name__}
+        )
+    try:
+        fb = await _fetch_funding_rate_bybit_rest(sym)
+        return fb
+    except Exception as e:
+        logger.warning(
+            "fetch_funding_rate_bybit_failed", extra={"symbol": bsym, "error": type(e).__name__}
+        )
         return {}
 
 
@@ -175,32 +306,51 @@ async def fetch_fear_greed_index() -> dict[str, Any]:
 
 
 async def fetch_exchange_volumes(symbol: str) -> dict[str, Any]:
-    """Спот Binance 24h ticker — объёмы и доля taker-buy как прокси «давления»."""
-    sym = _to_binance_symbol(symbol)
-    if not sym:
+    """Спот 24h: Binance, при недоступности — Bybit spot, затем OKX."""
+    sym_ccxt = normalize_ccxt_symbol(symbol)
+    bsym = _to_binance_symbol(sym_ccxt)
+    if not bsym:
         return {}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 "https://api.binance.com/api/v3/ticker/24hr",
-                params={"symbol": sym},
+                params={"symbol": bsym},
             )
             resp.raise_for_status()
             data = resp.json()
-        if not isinstance(data, dict):
-            return {}
-        qv = float(data.get("quoteVolume") or 0)
-        tbqv = float(data.get("takerBuyQuoteAssetVolume") or 0)
-        ratio = (tbqv / qv) if qv > 0 else None
-        return {
-            "quote_volume_24h": qv,
-            "taker_buy_quote_volume_24h": tbqv,
-            "taker_buy_quote_share": ratio,
-            "symbol": sym,
-            "source": "binance_spot_24hr",
-        }
+        if isinstance(data, dict):
+            qv = float(data.get("quoteVolume") or 0)
+            tbqv = float(data.get("takerBuyQuoteAssetVolume") or 0)
+            ratio = (tbqv / qv) if qv > 0 else None
+            return {
+                "quote_volume_24h": qv,
+                "taker_buy_quote_volume_24h": tbqv,
+                "taker_buy_quote_share": ratio,
+                "symbol": bsym,
+                "source": "binance_spot_24hr",
+            }
     except Exception as e:
-        logger.warning("fetch_exchange_volumes_failed", extra={"symbol": sym, "error": type(e).__name__})
+        logger.warning(
+            "fetch_exchange_volumes_binance_failed",
+            extra={"symbol": bsym, "error": type(e).__name__},
+        )
+    try:
+        out = await _fetch_exchange_volumes_bybit_spot_rest(sym_ccxt)
+        if out:
+            return out
+    except Exception as e:
+        logger.warning(
+            "fetch_exchange_volumes_bybit_failed",
+            extra={"symbol": bsym, "error": type(e).__name__},
+        )
+    try:
+        return await _fetch_exchange_volumes_okx_rest(sym_ccxt)
+    except Exception as e:
+        logger.warning(
+            "fetch_exchange_volumes_okx_failed",
+            extra={"symbol": bsym, "error": type(e).__name__},
+        )
         return {}
 
 
@@ -236,9 +386,14 @@ def _pack_onchain_proxy_fields(
             fr_pct = float(market["funding_rate"])
         except (TypeError, ValueError):
             fr_pct = None
-    funding_rate_str = (
-        f"{fr_pct:.6f}% (Binance USDT-M premiumIndex)" if fr_pct is not None else "Нет данных"
-    )
+    fr_src = funding_rest.get("source") if isinstance(funding_rest.get("source"), str) else ""
+    m_src = market.get("source") if isinstance(market.get("source"), str) else ""
+    fr_label = "деривативный funding (REST)"
+    if fr_src == "bybit_linear" or m_src == "bybit_linear_rest":
+        fr_label = "Bybit linear perpetual"
+    elif fr_src in ("", "binance_usdm") and m_src in ("", "binance_futures_ccxt"):
+        fr_label = "Binance USDT-M premiumIndex"
+    funding_rate_str = f"{fr_pct:.6f}% ({fr_label})" if fr_pct is not None else "Нет данных"
 
     fg_val = fear_greed.get("value")
     fg_cls = fear_greed.get("classification", "")
@@ -248,15 +403,23 @@ def _pack_onchain_proxy_fields(
 
     qv = exchange_vol.get("quote_volume_24h")
     ratio = exchange_vol.get("taker_buy_quote_share")
+    vol_src = exchange_vol.get("source") if isinstance(exchange_vol.get("source"), str) else ""
+    vol_venue = (
+        "OKX spot 24h"
+        if vol_src == "okx_spot_24hr"
+        else "Bybit spot 24h"
+        if vol_src == "bybit_spot_24hr"
+        else "Binance spot 24h"
+    )
     approx_flow_str = "Нет данных"
     if isinstance(qv, (int, float)) and qv > 0:
         if ratio is not None:
             approx_flow_str = (
                 f"Quote vol 24h: {float(qv):,.0f} USDT | "
-                f"taker-buy quote share: {float(ratio) * 100:.2f}% (Binance spot 24h, прокси давления)"
+                f"taker/buy proxy share: {float(ratio) * 100:.2f}% ({vol_venue}, прокси давления)"
             )
         else:
-            approx_flow_str = f"Quote vol 24h: {float(qv):,.0f} USDT (Binance spot 24h)"
+            approx_flow_str = f"Quote vol 24h: {float(qv):,.0f} USDT ({vol_venue})"
 
     onchain_proxy_ok = bool(
         fr_pct is not None
@@ -626,17 +789,12 @@ def calculate_indicators(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-    retry=retry_if_exception_type(Exception),
-)
 async def _fetch_market_metrics_remote(symbol: str) -> dict[str, Any]:
+    sym = normalize_ccxt_symbol(symbol)
     exchange = await _new_binance_exchange()
     try:
-        funding = await exchange.fetch_funding_rate(symbol)
-        ticker = await exchange.fetch_ticker(symbol)
+        funding = await exchange.fetch_funding_rate(sym)
+        ticker = await exchange.fetch_ticker(sym)
     finally:
         await exchange.close()
     return {
@@ -650,6 +808,19 @@ async def _fetch_market_metrics_remote(symbol: str) -> dict[str, Any]:
     }
 
 
+async def _fetch_market_metrics_remote_with_fallback(symbol: str) -> dict[str, Any]:
+    """Сначала Binance futures (ccxt), при ошибке — Bybit linear REST (EU/hosting)."""
+    sym = normalize_ccxt_symbol(symbol)
+    try:
+        return await _fetch_market_metrics_remote(sym)
+    except Exception as e:
+        logger.warning(
+            "market_metrics_binance_remote_failed",
+            extra={"symbol": sym, "error": type(e).__name__},
+        )
+    return await _bybit_linear_metrics_rest(sym)
+
+
 async def fetch_market_metrics(symbol: str) -> dict[str, Any]:
     key = _cache_key("metrics", symbol=symbol)
     ttl_s = 300
@@ -659,7 +830,7 @@ async def fetch_market_metrics(symbol: str) -> dict[str, Any]:
         out["stale_data"] = False
         return out
     try:
-        payload = await _fetch_market_metrics_remote(symbol)
+        payload = await _fetch_market_metrics_remote_with_fallback(symbol)
         payload["stale_data"] = False
         await _set_cache(key, payload, ttl_s)
         return dict(payload)

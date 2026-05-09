@@ -127,7 +127,9 @@ async def get_market_health() -> dict:
             elapsed = int((time.perf_counter() - started) * 1000)
             sources[name] = ok
             latency_ms[name] = elapsed
-    status = "healthy" if all(sources.values()) else "degraded"
+    # Binance ping часто падает с EU/hosting (451); для бейджа достаточно любой крипто-REST.
+    crypto_ok = bool(sources.get("binance") or sources.get("bybit"))
+    status = "healthy" if crypto_ok else "degraded"
     return {
         "status": status,
         "sources": sources,
