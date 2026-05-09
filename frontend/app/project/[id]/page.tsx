@@ -87,6 +87,20 @@ import {
   RefreshCw,
 } from 'lucide-react'
 
+/**
+ * Сколько ждать все ответы агентов при polling GET /chat после отправки сообщения.
+ * На бэкенде при debate=off часто используется последовательная цепочка с лимитом ~25s на агента
+ * (`run_sequential_discussion`), поэтому фиксированные 30s обрывали опрос до прихода 2-го/3-го ответа.
+ */
+function chatAgentRepliesPollBudgetMs(pendingAgentCount: number): number {
+  const n = Math.max(1, pendingAgentCount)
+  const msPerAgent = 45_000
+  /** Не обрывать polling раньше чем через 60 с; для нескольких агентов бюджет растёт пропорционально n. */
+  const minimum = 60_000
+  const maximum = 480_000
+  return Math.min(maximum, Math.max(minimum, n * msPerAgent))
+}
+
 /** Стабильная подпись области чата: без неё каждый poll создаёт новый массив messages и вызывает лишний smooth-scroll. */
 function chatScrollFingerprint(
   messages: ChatMessageType[],
@@ -723,13 +737,17 @@ export default function ProjectWorkspacePage({ params }: { params: Promise<{ id:
                   .map((m) => m.agentId)
               )
               const allDone = pendingIds.every((pid) => repliedIds.has(pid))
-              const timedOut = Date.now() - startedAt > 30_000
+              const pollBudgetMs = chatAgentRepliesPollBudgetMs(pendingIds.length)
+              const timedOut = Date.now() - startedAt > pollBudgetMs
               if (allDone || timedOut) {
                 stopPolling()
                 setIsDiscussing(false)
                 setDiscussionCtx(null)
                 toast.dismiss(loadingToast)
                 discussToastRef.current = null
+                if (timedOut && !allDone) {
+                  toast.error(t('project.toastDiscussTimeout'))
+                }
                 setIsRoutingQuestion(false)
                 return true
               }
@@ -872,7 +890,8 @@ export default function ProjectWorkspacePage({ params }: { params: Promise<{ id:
               .map((m) => m.agentId)
           )
           const allDone = pendingIds.every((pid) => repliedIds.has(pid))
-          const timedOut = Date.now() - startedAt > 30_000
+          const pollBudgetMs = chatAgentRepliesPollBudgetMs(pendingIds.length)
+          const timedOut = Date.now() - startedAt > pollBudgetMs
 
           if (allDone || timedOut) {
             stopPolling()

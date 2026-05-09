@@ -14,7 +14,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -403,10 +403,13 @@ async def fetch_live_context(
             df = await fetch_ohlcv(symbol, tf, limit)
     except Exception:
         if cached_ohlcv is None:
+            now_u = datetime.now(UTC)
             return {
                 "asset": symbol,
                 "timeframe": tf,
-                "updated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M"),
+                "updated_at": now_u.strftime("%Y-%m-%d %H:%M"),
+                "current_system_time_utc": now_u.strftime("%Y-%m-%d %H:%M"),
+                "last_ohlcv_candle_utc": None,
                 "data_freshness": "unavailable",
                 "source": "unavailable",
                 "stale_data": True,
@@ -437,10 +440,24 @@ async def fetch_live_context(
         if prev:
             day_change = ((price - prev) / prev) * 100.0 if price is not None else None
 
+    now_utc = datetime.now(UTC)
+    last_ohlcv_candle_utc: str | None = None
+    if not df.empty and "timestamp" in df.columns:
+        ts = df["timestamp"].iloc[-1]
+        if pd.notna(ts):
+            ts_pd = pd.Timestamp(ts)
+            if ts_pd.tzinfo is None:
+                ts_pd = ts_pd.tz_localize("UTC")
+            else:
+                ts_pd = ts_pd.tz_convert("UTC")
+            last_ohlcv_candle_utc = ts_pd.strftime("%Y-%m-%d %H:%M UTC")
+
     return {
         "asset": symbol,
         "timeframe": tf.upper(),
-        "updated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M"),
+        "updated_at": now_utc.strftime("%Y-%m-%d %H:%M"),
+        "current_system_time_utc": now_utc.strftime("%Y-%m-%d %H:%M"),
+        "last_ohlcv_candle_utc": last_ohlcv_candle_utc,
         "open": float(pd.to_numeric(df["open"], errors="coerce").iloc[-1]) if not df.empty else None,
         "high": float(pd.to_numeric(df["high"], errors="coerce").iloc[-1]) if not df.empty else None,
         "low": float(pd.to_numeric(df["low"], errors="coerce").iloc[-1]) if not df.empty else None,
@@ -459,9 +476,14 @@ async def fetch_live_context(
 
 
 def format_live_context_markdown(ctx: dict[str, Any]) -> str:
+    current_system_time = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
+    time_header = f"CURRENT_SYSTEM_TIME: {current_system_time} UTC\n"
+
     if not ctx or ctx.get("data_freshness") == "unavailable":
         return (
-            "📊 LIVE DATA CONTEXT (Updated: Нет данных)\n"
+            time_header
+            + "LAST_OHLCV_CANDLE_CLOSE_TIME: Нет данных\n"
+            + "📊 LIVE DATA CONTEXT (Updated: Нет данных)\n"
             "Asset: Нет данных | Timeframe: Нет данных\n"
             "Price: Нет данных | 24h Δ: Нет данных\n"
             "📈 Indicators: RSI(14)=Нет данных, MACD=Нет данных, EMA(20/50)=Нет данных, ATR=Нет данных\n"
@@ -476,8 +498,27 @@ def format_live_context_markdown(ctx: dict[str, Any]) -> str:
     news_summary = " | ".join(
         f"{n.get('title', 'Нет данных')} ({n.get('tone', 'neutral')})" for n in news[:2]
     ) or "Нет данных"
+    last_candle = ctx.get("last_ohlcv_candle_utc") or "Нет данных"
+    staleness_hint = ""
+    raw_lc = ctx.get("last_ohlcv_candle_utc")
+    if isinstance(raw_lc, str) and raw_lc not in ("Нет данных", ""):
+        try:
+            parsed = datetime.strptime(raw_lc.replace(" UTC", "").strip(), "%Y-%m-%d %H:%M").replace(
+                tzinfo=UTC
+            )
+            if datetime.now(UTC) - parsed > timedelta(hours=24):
+                staleness_hint = (
+                    "CANDLE_VS_NOW_HINT: последняя свеча старше 24 ч относительно CURRENT_SYSTEM_TIME "
+                    "→ укажи «Данные устарели» в ответе.\n"
+                )
+        except ValueError:
+            pass
+
     return (
-        f"📊 LIVE DATA CONTEXT (Updated: {ctx.get('updated_at')} UTC)\n"
+        time_header
+        + f"LAST_OHLCV_CANDLE_CLOSE_TIME: {last_candle}\n"
+        + staleness_hint
+        + f"📊 LIVE DATA CONTEXT (Updated: {ctx.get('updated_at')} UTC)\n"
         f"Asset: {ctx.get('asset')} | Timeframe: {ctx.get('timeframe')}\n"
         f"Price: {ctx.get('price', 'Нет данных')} | 24h Δ: {ctx.get('change_24h_pct', 'Нет данных')}%\n"
         f"📈 Indicators: RSI(14)={ind.get('rsi_14', 'Нет данных')}, "
