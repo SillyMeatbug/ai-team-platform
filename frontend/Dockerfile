@@ -2,10 +2,11 @@ FROM node:18-alpine AS builder
 
 WORKDIR /app
 
-COPY package*.json ./
+# Railway build context is repo root when Dockerfile path is frontend/Dockerfile.
+COPY frontend/package*.json ./
 RUN npm install
 
-COPY . .
+COPY frontend/ ./
 RUN npm run build
 
 FROM node:18-alpine AS runner
