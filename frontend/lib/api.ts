@@ -39,7 +39,9 @@ type RequestOptions = {
   signal?: AbortSignal
 }
 
-const API_FETCH_TIMEOUT_MS = 15_000
+const API_FETCH_TIMEOUT_MS = 30_000
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const controller = new AbortController()
@@ -99,6 +101,20 @@ async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<
     return undefined as T
   }
   return (await res.json()) as T
+}
+
+async function apiFetchWithRetry<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  try {
+    return await apiFetch<T>(path, options)
+  } catch (e) {
+    const isGet = (options.method ?? 'GET') === 'GET'
+    const msg = e instanceof Error ? e.message : ''
+    const isTimeout = msg.includes('Нет ответа от API')
+    if (!isGet || !isTimeout) throw e
+    // Railway может отвечать медленно на первом запросе после cold start/deploy.
+    await sleep(800)
+    return await apiFetch<T>(path, options)
+  }
 }
 
 type ApiProject = {
@@ -403,7 +419,7 @@ function mapPaperTrade(api: ApiPaperTrade): PaperTrade {
 }
 
 export async function getProjects(signal?: AbortSignal): Promise<Project[]> {
-  const data = await apiFetch<ApiProject[]>('/v1/projects', { signal })
+  const data = await apiFetchWithRetry<ApiProject[]>('/v1/projects', { signal })
   return data.map(mapProject)
 }
 
@@ -431,7 +447,7 @@ export async function updateProject(
 }
 
 export async function getProject(projectId: string): Promise<Project> {
-  const data = await apiFetch<ApiProject>(`/v1/projects/${projectId}`)
+  const data = await apiFetchWithRetry<ApiProject>(`/v1/projects/${projectId}`)
   return mapProject(data)
 }
 
@@ -440,12 +456,12 @@ export async function deleteProject(projectId: string): Promise<void> {
 }
 
 export async function getAllAgents(): Promise<Agent[]> {
-  const data = await apiFetch<ApiAgent[]>('/v1/agents')
+  const data = await apiFetchWithRetry<ApiAgent[]>('/v1/agents')
   return data.map(mapAgent)
 }
 
 export async function getProjectAgents(projectId: string): Promise<Agent[]> {
-  const data = await apiFetch<ApiProjectAgent[]>(`/v1/projects/${projectId}/agents`)
+  const data = await apiFetchWithRetry<ApiProjectAgent[]>(`/v1/projects/${projectId}/agents`)
   return data.map((item) => mapAgent(item.agent))
 }
 
@@ -461,7 +477,7 @@ export async function removeProjectAgent(projectId: string, agentId: string): Pr
 }
 
 export async function getProjectFiles(projectId: string): Promise<ProjectFile[]> {
-  const data = await apiFetch<ApiProjectFile[]>(`/v1/projects/${projectId}/files`)
+  const data = await apiFetchWithRetry<ApiProjectFile[]>(`/v1/projects/${projectId}/files`)
   return data.map(mapFile)
 }
 
@@ -497,7 +513,7 @@ export function getDownloadUrl(fileId: string): string {
 }
 
 export async function getProjectChat(projectId: string): Promise<ChatMessage[]> {
-  const data = await apiFetch<ApiChatMessage[]>(`/v1/projects/${projectId}/chat`)
+  const data = await apiFetchWithRetry<ApiChatMessage[]>(`/v1/projects/${projectId}/chat`)
   return data.map(mapChatMessage)
 }
 
@@ -703,12 +719,12 @@ export async function streamChatMessage(
 }
 
 export async function getDebateThread(projectId: string, threadId: string): Promise<DebateThread> {
-  const data = await apiFetch<ApiDebateThread>(`/v1/projects/${projectId}/debates/${threadId}`)
+  const data = await apiFetchWithRetry<ApiDebateThread>(`/v1/projects/${projectId}/debates/${threadId}`)
   return mapDebateThread(data)
 }
 
 export async function getDebateLog(projectId: string, threadId: string): Promise<DebateLog> {
-  const data = await apiFetch<{
+  const data = await apiFetchWithRetry<{
     thread: ApiDebateThread
     rounds: ApiDebateRound[]
     turns: ApiDebateTurn[]
@@ -728,7 +744,7 @@ export async function cancelDebateThread(projectId: string, threadId: string): P
 }
 
 export async function getProjectResults(projectId: string): Promise<AgentResult[]> {
-  const data = await apiFetch<ApiResult[]>(`/v1/projects/${projectId}/results`)
+  const data = await apiFetchWithRetry<ApiResult[]>(`/v1/projects/${projectId}/results`)
   return data.map(mapResult)
 }
 
@@ -742,11 +758,11 @@ export async function getMarketContext(
     timeframe,
     refresh: refresh ? 'true' : 'false',
   })
-  return await apiFetch<MarketContext>(`/v1/market/context?${qs.toString()}`)
+  return await apiFetchWithRetry<MarketContext>(`/v1/market/context?${qs.toString()}`)
 }
 
 export async function getMarketHealth(): Promise<MarketHealth> {
-  return await apiFetch<MarketHealth>('/v1/market/health')
+  return await apiFetchWithRetry<MarketHealth>('/v1/market/health')
 }
 
 export async function getProjectPaperTrades(
@@ -754,7 +770,7 @@ export async function getProjectPaperTrades(
   status?: 'open' | 'closed' | 'stopped' | 'expired'
 ): Promise<PaperTrade[]> {
   const qs = status ? `?status=${encodeURIComponent(status)}` : ''
-  const data = await apiFetch<ApiPaperTrade[]>(`/v1/projects/${projectId}/paper-trades${qs}`)
+  const data = await apiFetchWithRetry<ApiPaperTrade[]>(`/v1/projects/${projectId}/paper-trades${qs}`)
   return data.map(mapPaperTrade)
 }
 
