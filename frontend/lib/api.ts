@@ -103,18 +103,32 @@ async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<
   return (await res.json()) as T
 }
 
+function isRetryableFetchError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? '')
+  if (msg.includes('Нет ответа от API')) return true
+  if (msg.includes('Failed to fetch')) return true
+  if (msg.includes('NetworkError')) return true
+  if (msg.includes('Load failed')) return true
+  if (msg.includes('fetch failed')) return true
+  return error instanceof TypeError
+}
+
 async function apiFetchWithRetry<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  try {
-    return await apiFetch<T>(path, options)
-  } catch (e) {
-    const isGet = (options.method ?? 'GET') === 'GET'
-    const msg = e instanceof Error ? e.message : ''
-    const isTimeout = msg.includes('Нет ответа от API')
-    if (!isGet || !isTimeout) throw e
-    // Railway может отвечать медленно на первом запросе после cold start/deploy.
-    await sleep(800)
-    return await apiFetch<T>(path, options)
+  const isGet = (options.method ?? 'GET') === 'GET'
+  if (!isGet) return apiFetch<T>(path, options)
+
+  const backoff = [0, 800, 1500]
+  let lastError: unknown = null
+  for (let i = 0; i < backoff.length; i++) {
+    if (backoff[i] > 0) await sleep(backoff[i])
+    try {
+      return await apiFetch<T>(path, options)
+    } catch (e) {
+      lastError = e
+      if (!isRetryableFetchError(e)) throw e
+    }
   }
+  throw lastError
 }
 
 type ApiProject = {
